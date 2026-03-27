@@ -1350,12 +1350,18 @@ func detectZombieDeadSession(bd *BdCli, workDir, townRoot, rigName, polecatName,
 		// Spawning for too long — fall through to zombie handling
 	}
 
-	// A polecat whose hook bead is already CLOSED completed its work
-	// successfully. The dead session is expected (gt done kills it).
+	// A polecat whose hook bead is already CLOSED (or reaped) completed its
+	// work successfully. The dead session is expected (gt done kills it).
 	// Don't flag as zombie or trigger re-dispatch. (gt-sy8)
 	// gt-dsgp: Don't nuke — sandbox preserved for reuse.
-	if snapHook != "" && getBeadStatus(bd, workDir, snapHook) == "closed" {
-		return ZombieResult{}, false
+	// gt-qbh: Treat missing beads (empty status) as closed. Wisp beads get
+	// reaped after completion, so getBeadStatus returns "" for reaped wisps.
+	// A missing bead is not evidence of a crash.
+	if snapHook != "" {
+		hookStatus := getBeadStatus(bd, workDir, snapHook)
+		if hookStatus == "closed" || hookStatus == "" {
+			return ZombieResult{}, false
+		}
 	}
 
 	// TOCTOU guard: verify session wasn't recreated since detection.
