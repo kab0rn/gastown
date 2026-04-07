@@ -15,7 +15,10 @@ const (
 	TierEconomy CostTier = "economy"
 	// TierBudget uses haiku/sonnet for patrols, sonnet for workers.
 	TierBudget CostTier = "budget"
-	// TierCustomGroqOpus uses Opus for mayor/polecat/crew and Groq Compound for the rest.
+	// TierCustomGroqOpus routes patrol/utility roles to Groq Compound (fast +
+	// cheap) while keeping Opus for mayor, polecat, and crew (quality-critical
+	// work). The groq-compound preset uses the claude CLI as an SDK proxy —
+	// see AgentGroqCompound in agents.go for the full wiring.
 	TierCustomGroqOpus CostTier = "custom-groq-opus"
 )
 
@@ -165,7 +168,8 @@ func IsValidEffortLevel(level string) bool {
 }
 
 // CostTierAgents returns the custom agent definitions needed for a given tier.
-// These define the claude-sonnet, claude-haiku, and groq-compound agent presets.
+// These define the claude-sonnet, claude-haiku, and groq-compound agent presets
+// and are written into TownSettings.Agents so Gas Town can resolve them by name.
 // Standard tier returns an empty map (no custom agents needed).
 func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
 	switch tier {
@@ -178,6 +182,11 @@ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
 		}
 	case TierCustomGroqOpus:
 		return map[string]*RuntimeConfig{
+			// groq-compound is a first-class builtin (AgentGroqCompound) so we
+			// derive the RuntimeConfig directly from the registry. This ensures
+			// the correct ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY env vars, the
+			// right model flag, and all Claude-SDK plumbing are always in sync
+			// with the AgentPresetInfo definition in agents.go.
 			"groq-compound": groqCompoundPreset(),
 		}
 	default:
@@ -192,26 +201,39 @@ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
 // plan-based auto-detection that would otherwise enable 1M.
 func claudeSonnetPreset() *RuntimeConfig {
 	return &RuntimeConfig{
-		Command: "claude",
-		Args:    []string{"--dangerously-skip-permissions", "--model", "sonnet[1m]"},
+		Provider: string(AgentClaude),
+		Command:  "claude",
+		Args:     []string{"--dangerously-skip-permissions", "--model", "sonnet[1m]"},
 	}
 }
 
 // claudeHaikuPreset returns a RuntimeConfig for Claude Haiku.
 func claudeHaikuPreset() *RuntimeConfig {
 	return &RuntimeConfig{
-		Command: "claude",
-		Args:    []string{"--dangerously-skip-permissions", "--model", "haiku"},
+		Provider: string(AgentClaude),
+		Command:  "claude",
+		Args:     []string{"--dangerously-skip-permissions", "--model", "haiku"},
 	}
 }
 
-// groqCompoundPreset returns a RuntimeConfig for the Groq Compound model.
-// Adjust Command/Args if your Gastown runtime uses a different launcher for Groq.
+// groqCompoundPreset returns a RuntimeConfig for Groq's compound-beta model.
+//
+// The claude CLI is used as the SDK transport — it is redirected to Groq's
+// OpenAI-compatible endpoint by overriding two Anthropic SDK env vars:
+//
+//	ANTHROPIC_BASE_URL  = https://api.groq.com/openai/v1
+//	ANTHROPIC_API_KEY   = $GROQ_API_KEY  (resolved at spawn time from the shell env)
+//
+// This gives you:
+//   - Groq compound-beta reasoning on patrol/utility roles (low cost, fast)
+//   - Full Claude SDK hooks / session tracking / tmux detection inherited
+//   - Claude Opus on mayor, polecat, and crew via the default claude preset
+//
+// Prerequisite: export GROQ_API_KEY=gsk_... in your shell before starting gt.
 func groqCompoundPreset() *RuntimeConfig {
-	return &RuntimeConfig{
-		Command: "claude",
-		Args:    []string{"--dangerously-skip-permissions", "--model", "compound"},
-	}
+	// Derive from the canonical AgentGroqCompound builtin so Command, Args,
+	// Env, and all normalisation logic stay in one place (agents.go).
+	return RuntimeConfigFromPreset(AgentGroqCompound)
 }
 
 // ApplyCostTier writes the tier's agent and role_agents configuration to town settings.
@@ -330,7 +352,7 @@ func TierDescription(tier CostTier) string {
 	case TierBudget:
 		return "Patrol roles use Haiku, workers use Sonnet"
 	case TierCustomGroqOpus:
-		return "Mayor, Polecat, and Crew use Opus; the rest use Groq Compound"
+		return "Mayor/Polecat/Crew → Claude Opus; Deacon/Witness/Refinery/Boot/Dog → Groq compound-beta"
 	default:
 		return "Unknown tier"
 	}
