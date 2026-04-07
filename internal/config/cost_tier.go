@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -15,10 +16,7 @@ const (
 	TierEconomy CostTier = "economy"
 	// TierBudget uses haiku/sonnet for patrols, sonnet for workers.
 	TierBudget CostTier = "budget"
-	// TierCustomGroqOpus routes patrol/utility roles to Groq Compound (fast +
-	// cheap) while keeping Opus for mayor, polecat, and crew (quality-critical
-	// work). The groq-compound preset uses the claude CLI as an SDK proxy —
-	// see AgentGroqCompound in agents.go for the full wiring.
+	// TierCustomGroqOpus uses Opus for mayor/crew and Groq Compound for the rest.
 	TierCustomGroqOpus CostTier = "custom-groq-opus"
 )
 
@@ -50,14 +48,11 @@ func IsValidTier(tier string) bool {
 var TierManagedRoles = []string{"mayor", "deacon", "witness", "refinery", "polecat", "crew", "boot", "dog"}
 
 // CostTierRoleAgents returns the role_agents mapping for a given tier.
-// All tiers explicitly map every tier-managed role. Standard tier maps all roles
-// to empty string (meaning "use default/opus"), while other tiers specify
-// Claude model variants. Returns nil if the tier is invalid.
+// All tiers explicitly map every tier-managed role. Standard tier maps roles
+// to empty string when they should use the default/opus model.
 func CostTierRoleAgents(tier CostTier) map[string]string {
 	switch tier {
 	case TierStandard:
-		// Explicit mapping for all managed roles — empty value means "use default (opus)"
-		// Boot and dog are utility roles — always haiku even on standard tier
 		return map[string]string{
 			"mayor":    "",
 			"deacon":   "",
@@ -68,17 +63,19 @@ func CostTierRoleAgents(tier CostTier) map[string]string {
 			"boot":     "claude-haiku",
 			"dog":      "claude-haiku",
 		}
+
 	case TierEconomy:
 		return map[string]string{
 			"mayor":    "claude-sonnet",
 			"deacon":   "claude-haiku",
 			"witness":  "claude-sonnet",
 			"refinery": "claude-sonnet",
-			"polecat":  "", // use default (opus)
-			"crew":     "", // use default (opus)
+			"polecat":  "",
+			"crew":     "",
 			"boot":     "claude-haiku",
 			"dog":      "claude-haiku",
 		}
+
 	case TierBudget:
 		return map[string]string{
 			"mayor":    "claude-sonnet",
@@ -90,29 +87,25 @@ func CostTierRoleAgents(tier CostTier) map[string]string {
 			"boot":     "claude-haiku",
 			"dog":      "claude-haiku",
 		}
+
 	case TierCustomGroqOpus:
-		// Mayor, polecat, and crew keep the default (opus) for highest-quality work.
-		// All patrol and utility roles (deacon, witness, refinery, boot, dog) use
-		// Groq Compound for fast, low-cost background orchestration.
 		return map[string]string{
-			"mayor":    "",              // use default (opus)
+			"mayor":    "",
 			"deacon":   "groq-compound",
 			"witness":  "groq-compound",
 			"refinery": "groq-compound",
-			"polecat":  "",              // use default (opus)
-			"crew":     "",              // use default (opus)
+			"polecat":  "groq-compound",
+			"crew":     "",
 			"boot":     "groq-compound",
 			"dog":      "groq-compound",
 		}
+
 	default:
 		return nil
 	}
 }
 
 // CostTierAgents returns the custom agent definitions needed for a given tier.
-// These define the claude-sonnet, claude-haiku, and groq-compound agent presets
-// and are written into TownSettings.Agents so Gas Town can resolve them by name.
-// Standard tier returns an empty map (no custom agents needed).
 func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
 	switch tier {
 	case TierStandard:
@@ -124,11 +117,6 @@ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
 		}
 	case TierCustomGroqOpus:
 		return map[string]*RuntimeConfig{
-			// groq-compound is a first-class builtin (AgentGroqCompound) so we
-			// derive the RuntimeConfig directly from the registry. This ensures
-			// the correct ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY env vars, the
-			// right model flag, and all Claude-SDK plumbing are always in sync
-			// with the AgentPresetInfo definition in agents.go.
 			"groq-compound": groqCompoundPreset(),
 		}
 	default:
@@ -154,31 +142,23 @@ func claudeHaikuPreset() *RuntimeConfig {
 	}
 }
 
-// groqCompoundPreset returns a RuntimeConfig for Groq's compound-beta model.
-//
-// The claude CLI is used as the SDK transport — it is redirected to Groq's
-// OpenAI-compatible endpoint by overriding two Anthropic SDK env vars:
-//
-//	ANTHROPIC_BASE_URL  = https://api.groq.com/openai/v1
-//	ANTHROPIC_API_KEY   = $GROQ_API_KEY  (resolved at spawn time from the shell env)
-//
-// This gives you:
-//   - Groq compound-beta reasoning on patrol/utility roles (low cost, fast)
-//   - Full Claude SDK hooks / session tracking / tmux detection inherited
-//   - Claude Opus on mayor, polecat, and crew via the default claude preset
-//
-// Prerequisite: export GROQ_API_KEY=gsk_... in your shell before starting gt.
+// groqCompoundPreset returns a RuntimeConfig for the Groq Compound model.
+// Routes through Groq's OpenAI-compatible API using the Claude CLI with env var overrides.
 func groqCompoundPreset() *RuntimeConfig {
-	// Derive from the canonical AgentGroqCompound builtin so Command, Args,
-	// Env, and all normalisation logic stay in one place (agents.go).
-	return RuntimeConfigFromPreset(AgentGroqCompound)
+	return &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--dangerously-skip-permissions"},
+		Env: map[string]string{
+			"ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
+			"ANTHROPIC_API_KEY":  os.Getenv("GROQ_API_KEY"),
+			"ANTHROPIC_MODEL":    "compound-beta",
+		},
+	}
 }
 
 // ApplyCostTier writes the tier's agent and role_agents configuration to town settings.
 // Only tier-managed roles are modified — custom RoleAgents entries for non-tier roles
 // (or intentional non-Claude overrides) are preserved.
-// For standard tier, tier-managed roles are removed from RoleAgents (using defaults)
-// and tier-specific agent presets are cleaned up.
 func ApplyCostTier(settings *TownSettings, tier CostTier) error {
 	roleAgents := CostTierRoleAgents(tier)
 	if roleAgents == nil {
@@ -187,59 +167,47 @@ func ApplyCostTier(settings *TownSettings, tier CostTier) error {
 
 	agents := CostTierAgents(tier)
 
-	// Ensure RoleAgents map exists
 	if settings.RoleAgents == nil {
 		settings.RoleAgents = make(map[string]string)
 	}
 
-	// Only update tier-managed roles, preserving any custom entries
 	for _, role := range TierManagedRoles {
 		agentName := roleAgents[role]
 		if agentName == "" {
-			// Empty means "use default" — remove any tier override for this role
 			delete(settings.RoleAgents, role)
 		} else {
 			settings.RoleAgents[role] = agentName
 		}
 	}
 
-	// Ensure agents map exists
 	if settings.Agents == nil {
 		settings.Agents = make(map[string]*RuntimeConfig)
 	}
 
-	// For standard tier, remove all tier-specific agent presets if they exist
 	if tier == TierStandard {
 		delete(settings.Agents, "claude-sonnet")
 		delete(settings.Agents, "claude-haiku")
 		delete(settings.Agents, "groq-compound")
 	} else {
-		// Add/update tier-specific agent presets
 		for name, rc := range agents {
 			settings.Agents[name] = rc
 		}
 	}
 
-	// Track the tier for display purposes
 	settings.CostTier = string(tier)
-
 	return nil
 }
 
 // GetCurrentTier infers the current cost tier from the settings' RoleAgents.
 // Returns the tier name if it matches a known tier exactly, or empty string for custom configs.
-// Only tier-managed roles are compared — non-tier custom entries are ignored.
 func GetCurrentTier(settings *TownSettings) string {
-	// Check informational field first for quick path
 	if settings.CostTier != "" && IsValidTier(settings.CostTier) {
-		// Verify it still matches the actual config
 		expected := CostTierRoleAgents(CostTier(settings.CostTier))
 		if tierRolesMatch(settings.RoleAgents, expected) {
 			return settings.CostTier
 		}
 	}
 
-	// Infer from RoleAgents by checking each tier
 	for _, tierName := range ValidCostTiers() {
 		tier := CostTier(tierName)
 		expected := CostTierRoleAgents(tier)
@@ -248,16 +216,15 @@ func GetCurrentTier(settings *TownSettings) string {
 		}
 	}
 
-	return "" // Custom configuration
+	return ""
 }
 
 // tierRolesMatch checks if the actual RoleAgents map matches a tier's expected
-// assignments for tier-managed roles only. Non-tier custom entries in actual are ignored.
-// An empty or missing value in actual matches an empty expected value (both mean "use default").
+// assignments for tier-managed roles only.
 func tierRolesMatch(actual, expected map[string]string) bool {
 	for _, role := range TierManagedRoles {
-		actualVal := actual[role]     // "" if not present
-		expectedVal := expected[role] // "" means "use default"
+		actualVal := actual[role]
+		expectedVal := expected[role]
 		if actualVal != expectedVal {
 			return false
 		}
@@ -275,7 +242,7 @@ func TierDescription(tier CostTier) string {
 	case TierBudget:
 		return "Patrol roles use Haiku, workers use Sonnet"
 	case TierCustomGroqOpus:
-		return "Mayor/Polecat/Crew → Claude Opus; Deacon/Witness/Refinery/Boot/Dog → Groq compound-beta"
+		return "Mayor and Crew use Opus; the rest use Groq Compound"
 	default:
 		return "Unknown tier"
 	}
@@ -295,7 +262,8 @@ func FormatTierRoleTable(tier CostTier) string {
 		if agent == "" {
 			agent = "(default/opus)"
 		}
-		lines = append(lines, fmt.Sprintf("  %-10s %s", role+":", agent))
+		lines = append(lines, fmt.Sprintf(" %-10s %s", role+":", agent))
 	}
+
 	return strings.Join(lines, "\n")
 }
