@@ -36,6 +36,12 @@ const (
 	// AgentOmp is Oh My Pi (OMP) — Pi fork with hook-based lifecycle.
 	// Inspired by github.com/ProbabilityEngineer/pi-mono gastown integration.
 	AgentOmp AgentPreset = "omp"
+	// AgentGroqCompound routes the Claude CLI to Groq's compound-beta model via
+	// Groq's OpenAI-compatible API endpoint. The claude binary acts as the SDK
+	// proxy; ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY are overridden at runtime
+	// to redirect traffic to api.groq.com. GROQ_API_KEY must be set in the shell
+	// environment — it is read dynamically and never stored in config files.
+	AgentGroqCompound AgentPreset = "groq-compound"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
@@ -427,6 +433,61 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 			PromptFlag: "--prompt",
 		},
 	},
+	// AgentGroqCompound uses the Claude CLI as an SDK proxy but routes all
+	// requests to Groq's OpenAI-compatible endpoint by overriding the two
+	// Anthropic SDK environment variables that control the backend:
+	//
+	//   ANTHROPIC_BASE_URL  → https://api.groq.com/openai/v1
+	//   ANTHROPIC_API_KEY   → $GROQ_API_KEY  (read from the shell env at spawn time)
+	//
+	// The model flag --model groq/compound-beta selects Groq's compound
+	// reasoning model. Because the transport is the Claude binary, all Gas
+	// Town hooks, session tracking, tmux readiness detection, and Claude-SDK
+	// lifecycle events work identically to the standard claude preset.
+	//
+	// Prerequisites:
+	//   export GROQ_API_KEY=gsk_...
+	//
+	// The key is resolved at agent spawn time — never stored in config files.
+	AgentGroqCompound: {
+		Name:    AgentGroqCompound,
+		Command: "claude",
+		Args: []string{
+			"--dangerously-skip-permissions",
+			"--model", "groq/compound-beta",
+		},
+		// Override Anthropic SDK to route to Groq's OpenAI-compatible endpoint.
+		// ANTHROPIC_API_KEY is read from $GROQ_API_KEY at spawn time so no secret
+		// is ever written into the settings JSON.
+		Env: map[string]string{
+			"ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
+			// Shell expansion: the claude subprocess will inherit $GROQ_API_KEY
+			// from the parent process; we set ANTHROPIC_API_KEY to that value.
+			// Gas Town's session spawner merges Env entries into the process
+			// environment — use a shell-expansion sentinel so it is resolved
+			// lazily rather than embedded as a literal string.
+			"ANTHROPIC_API_KEY": "$GROQ_API_KEY",
+		},
+		// Groq Compound runs as the claude Node.js binary — same process names.
+		ProcessNames:  []string{"node", "claude"},
+		SessionIDEnv:  "CLAUDE_SESSION_ID",
+		ResumeFlag:    "--resume",
+		ContinueFlag:  "--continue",
+		ResumeStyle:   "flag",
+		SupportsHooks: true,
+		// Inherit full Claude hook plumbing — hooks go to .claude/settings.json.
+		PromptMode:           "arg",
+		ConfigDirEnv:         "CLAUDE_CONFIG_DIR",
+		ConfigDir:            ".claude",
+		HooksProvider:        "claude",
+		HooksDir:             ".claude",
+		HooksSettingsFile:    "settings.json",
+		HooksUseSettingsDir:  true,
+		ReadyPromptPrefix:    "❯ ",
+		ReadyDelayMs:         10000,
+		InstructionsFile:     "CLAUDE.md",
+		HasTurnBoundaryDrain: true,
+	},
 }
 
 // Registry state with proper synchronization.
@@ -780,7 +841,7 @@ func NewExampleAgentRegistry() *AgentRegistry {
 				ResumeFlag:   "--resume",
 				ResumeStyle:  "flag",
 				NonInteractive: &NonInteractiveConfig{
-					PromptFlag: "-m",
+					PromptFlag: "-p",
 					OutputFlag: "--json",
 				},
 			},
