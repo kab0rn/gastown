@@ -20,6 +20,11 @@ const (
 	// The groq-compound preset uses the claude CLI as an SDK proxy —
 	// see AgentGroqCompound in agents.go for the full wiring.
 	TierCustomGroqOpus CostTier = "custom-groq-opus"
+		// TierCustomGroqSonnet routes patrol/utility roles to Groq Compound (fast +
+		// cheap) while using Sonnet for mayor (quality-critical work).
+		// The groq-compound preset uses the claude CLI as an SDK proxy —
+		// see AgentGroqCompound in agents.go for the full wiring.
+		TierCustomGroqSonnet CostTier = "custom-groq-sonnet"
 )
 
 // ValidCostTiers returns all valid tier names.
@@ -29,13 +34,14 @@ func ValidCostTiers() []string {
 		string(TierEconomy),
 		string(TierBudget),
 		string(TierCustomGroqOpus),
+				string(TierCustomGroqSonnet),
 	}
 }
 
 // IsValidTier checks if a string is a valid cost tier name.
 func IsValidTier(tier string) bool {
 	switch CostTier(tier) {
-	case TierStandard, TierEconomy, TierBudget, TierCustomGroqOpus:
+	case TierStandard, TierEconomy, TierBudget, TierCustomGroqOpus:, TierCustomGroqSonnet
 		return true
 	default:
 		return false
@@ -104,6 +110,20 @@ func CostTierRoleAgents(tier CostTier) map[string]string {
 			"boot":     "groq-compound",
 			"dog":      "groq-compound",
 		}
+			case TierCustomGroqSonnet:
+				// Mayor uses Sonnet for quality-critical work.
+				// All other roles (crew, deacon, witness, refinery, polecat, boot, dog) use
+				// Groq Compound for fast, low-cost background orchestration.
+				return map[string]string{
+								"mayor":    "claude-sonnet",
+								"deacon":   "groq-compound",
+								"witness":  "groq-compound",
+								"refinery": "groq-compound",
+								"polecat":  "groq-compound",
+								"crew":     "groq-compound",
+								"boot":     "groq-compound",
+								"dog":      "groq-compound",
+							}
 
 	default:
 		return nil
@@ -190,6 +210,11 @@ func CostTierAgents(tier CostTier) map[string]*RuntimeConfig {
 			// with the AgentPresetInfo definition in agents.go.
 			"groq-compound": groqCompoundPreset(),
 		}
+			case TierCustomGroqSonnet:
+				return map[string]*RuntimeConfig{
+								"claude-sonnet": claudeSonnetPreset(),
+								"groq-compound": groqCompoundPreset(),
+							}
 	default:
 		return nil
 	}
@@ -341,6 +366,8 @@ func TierDescription(tier CostTier) string {
 		return "Patrol roles use Haiku, workers use Sonnet"
 	case TierCustomGroqOpus:
 		return "Mayor/Crew → Claude Opus; Deacon/Witness/Refinery/Polecat/Boot/Dog → Groq compound-beta"
+			case TierCustomGroqSonnet:
+				return "Mayor → Claude Sonnet; All other roles → Groq compound-beta"
 	default:
 		return "Unknown tier"
 	}
