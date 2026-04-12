@@ -8,10 +8,10 @@ import (
 func TestValidCostTiers(t *testing.T) {
 	t.Parallel()
 	tiers := ValidCostTiers()
-	if len(tiers) != 4 {
-		t.Fatalf("ValidCostTiers() returned %d tiers, want 4", len(tiers))
+	if len(tiers) != 5 {
+		t.Fatalf("ValidCostTiers() returned %d tiers, want 5", len(tiers))
 	}
-	expected := map[string]bool{"standard": true, "economy": true, "budget": true, "custom-groq-opus": true}
+	expected := map[string]bool{"standard": true, "economy": true, "budget": true, "custom-groq-opus": true, "custom-groq-sonnet": true}
 	for _, tier := range tiers {
 		if !expected[tier] {
 			t.Errorf("unexpected tier %q", tier)

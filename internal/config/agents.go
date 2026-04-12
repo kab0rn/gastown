@@ -486,10 +486,10 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		Command: "claude",
 		Args: []string{
 			"--dangerously-skip-permissions",
-			"--model", "groq/compound-beta",
 		},
 		Env: map[string]string{
 			"ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
+			"ANTHROPIC_MODEL":    "compound-beta",
 			"ANTHROPIC_API_KEY":  "$GROQ_API_KEY",
 		},
 		ProcessNames:         []string{"node", "claude"},
