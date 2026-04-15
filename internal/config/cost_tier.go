@@ -262,10 +262,10 @@ func groqCompoundPreset() *RuntimeConfig {
 	// Derive from the canonical AgentGroqCompound builtin so Command, Args,
 	// Env, and all normalisation logic stay in one place (agents.go).
 	// $GROQ_API_KEY is kept as-is; the agent spawn code expands env sentinels
-	// at runtime, matching the behaviour of all other preset env vars.
+	// at runtime, matching the behavior of all other preset env vars.
 	rc := RuntimeConfigFromPreset(AgentGroqCompound)
 	if rc == nil {
-		// Defensive fallback: builtin registry not initialised (e.g. unit tests
+		// Defensive fallback: builtin registry not initialized (e.g. unit tests
 		// that don't call initRegistryLocked). Build the config directly so
 		// callers never receive a nil and panic on Env access.
 		return &RuntimeConfig{
