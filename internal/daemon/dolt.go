@@ -280,10 +280,10 @@ func (m *DoltServerManager) buildDoltSQLCmd(ctx context.Context, args ...string)
 		if inherited, ok := os.LookupEnv("DOLT_CLI_PASSWORD"); ok {
 			cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD="+inherited)
 		} else {
-			cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD=")
+			cmd.Env = append(envWithout(os.Environ(), "DOLT_CLI_PASSWORD"), "DOLT_CLI_PASSWORD=")
 		}
 	} else {
-		cmd.Env = append(os.Environ(), "DOLT_CLI_PASSWORD=")
+		cmd.Env = append(envWithout(os.Environ(), "DOLT_CLI_PASSWORD"), "DOLT_CLI_PASSWORD=")
 	}
 
 	return cmd
@@ -1514,4 +1514,17 @@ func StopAllDoltServers(force bool) (int, int) {
 		killed = 0
 	}
 	return killed, after
+}
+
+// envWithout returns a copy of env with all entries whose key matches prefix removed.
+// Used to strip inherited DOLT_CLI_PASSWORD before forcing an explicit value.
+func envWithout(env []string, key string) []string {
+	prefix := key + "="
+	out := env[:0:0]
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
