@@ -228,7 +228,8 @@ func findSlingContext(t *testing.T, hqPath, workBeadID string) *capacity.SlingCo
 	return nil
 }
 
-// hasSlingContext checks if a work bead has an open sling context in any beads dir.
+// hasSlingContext checks if a work bead has an open sling context anywhere
+// under townRoot (HQ or any rig beads dir).
 func hasSlingContext(t *testing.T, hqPath, workBeadID string) bool {
 	t.Helper()
 	return findSlingContext(t, hqPath, workBeadID) != nil
@@ -463,14 +464,10 @@ func TestSchedulerSlingContextIdempotency(t *testing.T) {
 	slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
 	slingToScheduler(t, gtBinary, hqPath, env, beadID, "testrig")
 
-	// Verify: only one sling context exists
-	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
-	contexts, err := townBeads.ListOpenSlingContexts()
-	if err != nil {
-		t.Fatalf("ListOpenSlingContexts failed: %v", err)
-	}
+	// Verify: only one sling context exists across all rig dirs
+	// (sling contexts live in the target rig's beads dir per dee628d3).
 	count := 0
-	for _, ctx := range contexts {
+	for _, ctx := range listAllSlingContexts(hqPath) {
 		fields := beads.ParseSlingContextFields(ctx.Description)
 		if fields != nil && fields.WorkBeadID == beadID {
 			count++
