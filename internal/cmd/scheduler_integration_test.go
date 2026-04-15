@@ -209,19 +209,26 @@ func createSlingContext(t *testing.T, hqPath string, fields *capacity.SlingConte
 	return ctxBead.ID
 }
 
-// findSlingContext finds an open sling context for a work bead in the HQ beads DB.
+// findSlingContext finds an open sling context for a work bead across all beads
+// dirs (HQ + all rig dirs). Since GH#3468, sling contexts are created in the
+// target rig's beads dir, not HQ, so we must scan all dirs.
 // Returns nil if none found.
 func findSlingContext(t *testing.T, hqPath, workBeadID string) *capacity.SlingContextFields {
 	t.Helper()
-	townBeads := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
-	_, fields, err := townBeads.FindOpenSlingContext(workBeadID)
-	if err != nil {
-		t.Fatalf("FindOpenSlingContext(%s) failed: %v", workBeadID, err)
+	for _, dir := range beadsSearchDirs(hqPath) {
+		b := beads.NewWithBeadsDir(dir, beads.ResolveBeadsDir(dir))
+		_, fields, err := b.FindOpenSlingContext(workBeadID)
+		if err != nil {
+			continue // Partial failure is acceptable — skip unavailable dirs
+		}
+		if fields != nil {
+			return fields
+		}
 	}
-	return fields
+	return nil
 }
 
-// hasSlingContext checks if a work bead has an open sling context in HQ.
+// hasSlingContext checks if a work bead has an open sling context in any beads dir.
 func hasSlingContext(t *testing.T, hqPath, workBeadID string) bool {
 	t.Helper()
 	return findSlingContext(t, hqPath, workBeadID) != nil
