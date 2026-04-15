@@ -140,6 +140,9 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	routes := []beads.Route{
 		{Prefix: hqPrefix + "-", Path: "."},
 		{Prefix: rigPrefix + "-", Path: "testrig/mayor/rig"},
+		// hq-cv- is the auto-convoy prefix registered by gt install (install.go:684).
+		// Required so bd can resolve convoy IDs created by createAutoConvoy().
+		{Prefix: "hq-cv-", Path: "."},
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
@@ -583,6 +586,9 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 		{Prefix: hqPrefix + "-", Path: "."},
 		{Prefix: rig1Prefix + "-", Path: "rig1/mayor/rig"},
 		{Prefix: rig2Prefix + "-", Path: "rig2/mayor/rig"},
+		// hq-cv- is the auto-convoy prefix registered by gt install (install.go:684).
+		// Required so bd can resolve convoy IDs created by createAutoConvoy().
+		{Prefix: "hq-cv-", Path: "."},
 	}
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
