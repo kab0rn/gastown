@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/testutil"
@@ -145,7 +147,8 @@ func createTestBead(t *testing.T, dir, title string) string {
 // Runs bd show --json from dir and inspects the labels array.
 func beadHasLabel(t *testing.T, beadID, label, dir string) bool {
 	t.Helper()
-	cmd := exec.Command("bd", "show", beadID, "--json", "--allow-stale")
+	args := beads.MaybePrependAllowStale([]string{"show", beadID, "--json"})
+	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -171,7 +174,8 @@ func beadHasLabel(t *testing.T, beadID, label, dir string) bool {
 // getBeadDescription returns the description of a bead via bd show --json.
 func getBeadDescription(t *testing.T, beadID, dir string) string {
 	t.Helper()
-	cmd := exec.Command("bd", "show", beadID, "--json", "--allow-stale")
+	args := beads.MaybePrependAllowStale([]string{"show", beadID, "--json"})
+	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -220,14 +224,56 @@ func addBeadDependency(t *testing.T, blocked, blocker, dir string) {
 }
 
 // addBeadDependencyOfType adds a dependency with a specific type (e.g., "tracks",
-// "depends_on"). The from bead must exist in the local DB at dir; the to bead can
-// be in a different DB if routes.jsonl is present in dir's .beads/.
+// "depends_on"). The from bead must exist in the local DB at dir; if the to bead
+// lives in a different rig DB (per the town's routes.jsonl), it is rewritten as
+// an external:<rig>:<id> reference, which is bd v1.0.0's required cross-DB form.
 func addBeadDependencyOfType(t *testing.T, from, to, depType, dir string) {
 	t.Helper()
-	cmd := exec.Command("bd", "dep", "add", from, to, "--type="+depType)
+	target := resolveCrossRigTarget(t, dir, from, to)
+	cmd := exec.Command("bd", "dep", "add", from, target, "--type="+depType)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("bd dep add %s %s --type=%s failed: %v\n%s", from, to, depType, err, out)
+		t.Fatalf("bd dep add %s %s --type=%s failed: %v\n%s", from, target, depType, err, out)
+	}
+}
+
+// resolveCrossRigTarget returns `to` unchanged when `from` and `to` share a DB,
+// otherwise returns external:<rig>:<to>. Walks up from dir to find the town
+// .beads/routes.jsonl that maps prefixes → rig paths.
+func resolveCrossRigTarget(t *testing.T, dir, from, to string) string {
+	t.Helper()
+	if strings.HasPrefix(to, "external:") {
+		return to
+	}
+	fromPrefix := beads.ExtractPrefix(from)
+	toPrefix := beads.ExtractPrefix(to)
+	if fromPrefix == "" || toPrefix == "" || fromPrefix == toPrefix {
+		return to
+	}
+	townRoot := findTownRootFromDir(dir)
+	if townRoot == "" {
+		return to
+	}
+	rigName := beads.GetRigNameForPrefix(townRoot, toPrefix)
+	if rigName == "" {
+		return to
+	}
+	return "external:" + rigName + ":" + to
+}
+
+// findTownRootFromDir walks up from start until it finds a .beads/routes.jsonl, then
+// returns that directory. Returns "" if no routes file is found.
+func findTownRootFromDir(start string) string {
+	cur := start
+	for {
+		if _, err := os.Stat(filepath.Join(cur, ".beads", "routes.jsonl")); err == nil {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		cur = parent
 	}
 }
 

@@ -310,33 +310,10 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 		t.Fatalf("convoy ID not stored in sling context")
 	}
 
-	// Verify: convoy is resolvable via bd show from hq.
-	// --allow-stale is a global flag: must come before the subcommand.
-	// Use Output() so stderr (permission/deprecation warnings) doesn't pollute JSON.
-	showArgs := beads.MaybePrependAllowStale([]string{"show", fields.Convoy, "--json"})
-	cmd := exec.Command("bd", showArgs...)
-	cmd.Dir = hqPath
-	out, err := cmd.Output()
-	if err != nil {
-		stderr := ""
-		if ee, ok := err.(*exec.ExitError); ok {
-			stderr = string(ee.Stderr)
-		}
-		t.Fatalf("bd show convoy %s failed: %v\nstdout: %s\nstderr: %s", fields.Convoy, err, out, stderr)
-	}
-	var convoys []struct {
-		ID        string `json:"id"`
-		IssueType string `json:"issue_type"`
-	}
-	if err := json.Unmarshal(out, &convoys); err != nil {
-		t.Fatalf("parse convoy show (output=%q): %v", out, err)
-	}
-	if len(convoys) == 0 {
-		t.Fatalf("convoy %s not found via bd show", fields.Convoy)
-	}
-	if convoys[0].IssueType != "convoy" {
-		t.Errorf("convoy issue_type = %q, want %q", convoys[0].IssueType, "convoy")
-	}
+	// Verify: convoy is resolvable via the SDK store (bd CLI's `bd show` runs a
+	// schema-dependent SQL path that breaks across CLI/SDK version skews; querying
+	// through the SDK is what production code does anyway).
+	assertConvoyExists(t, hqPath, fields.Convoy)
 
 	// Verify: convoy has a "tracks" dependency pointing to the rig bead.
 	// This is the core cross-rig link: convoy lives in HQ DB, bead in rig DB.
@@ -352,6 +329,46 @@ func TestSchedulerAutoConvoyCreation(t *testing.T) {
 	// to verify; log a skip-warning instead of failing until that bug is
 	// fixed separately.
 	assertConvoyTracksBead(t, hqPath, fields.Convoy, beadID)
+}
+
+// assertConvoyExists verifies a convoy issue exists in the HQ DB and is of type
+// "convoy". Uses the SDK store directly to avoid bd CLI/SDK schema skew.
+func assertConvoyExists(t *testing.T, hqPath, convoyID string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	b := beads.NewWithBeadsDir(hqPath, filepath.Join(hqPath, ".beads"))
+	store, cleanup, err := b.OpenStore(ctx)
+	if err != nil {
+		t.Fatalf("open hq store: %v", err)
+	}
+	defer cleanup()
+
+	var issueType string
+	var found bool
+	txErr := store.RunInTransaction(ctx, "", func(tx beadsdk.Transaction) error {
+		issue, err := tx.GetIssue(ctx, convoyID)
+		if err != nil {
+			return err
+		}
+		if issue == nil {
+			return nil
+		}
+		found = true
+		issueType = string(issue.IssueType)
+		return nil
+	})
+	if txErr != nil {
+		t.Fatalf("get convoy %s: %v", convoyID, txErr)
+	}
+	if !found {
+		t.Fatalf("convoy %s not found in hq store", convoyID)
+	}
+	if issueType != "convoy" {
+		t.Errorf("convoy issue_type = %q, want %q", issueType, "convoy")
+	}
 }
 
 // assertConvoyTracksBead verifies the HQ convoy has a "tracks" dependency
