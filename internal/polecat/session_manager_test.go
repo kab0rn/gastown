@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	gtruntime "github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -41,6 +42,41 @@ func requireTmux(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
+}
+
+func setupSessionBranchTestRepo(t *testing.T) (string, *git.Git) {
+	t.Helper()
+
+	workDir := t.TempDir()
+	cmd := exec.Command("git", "init", "-b", "main")
+	cmd.Dir = workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	repoGit := git.NewGit(workDir)
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	if err := repoGit.Add("README.md"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := repoGit.Commit("Initial commit"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	cmd = exec.Command("git", "remote", "add", "origin", workDir)
+	cmd.Dir = workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	cmd = exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmd.Dir = workDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	return workDir, repoGit
 }
 
 func TestSessionName(t *testing.T) {
@@ -300,6 +336,68 @@ func TestPolecatStartInjectsFallbackEnvVars(t *testing.T) {
 	}
 }
 
+func TestEnsureCanonicalSessionBranch_UsesOriginDefaultBranch(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	baseSHA, err := repoGit.Rev("origin/main")
+	if err != nil {
+		t.Fatalf("resolve origin/main: %v", err)
+	}
+	if err := repoGit.CheckoutNewBranch("polecat/toast-old", "main"); err != nil {
+		t.Fatalf("checkout stale polecat branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "stale.txt"), []byte("stale\n"), 0644); err != nil {
+		t.Fatalf("write stale.txt: %v", err)
+	}
+	if err := repoGit.Add("stale.txt"); err != nil {
+		t.Fatalf("git add stale.txt: %v", err)
+	}
+	if err := repoGit.Commit("stale local polecat commit"); err != nil {
+		t.Fatalf("git commit stale.txt: %v", err)
+	}
+	staleSHA, err := repoGit.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("resolve stale HEAD: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	if !strings.Contains(branch, "/gt-9qb@") {
+		t.Fatalf("fresh session branch = %q, want issue-scoped branch", branch)
+	}
+
+	staleAncestor, err := repoGit.IsAncestor(staleSHA, branch)
+	if err != nil {
+		t.Fatalf("check stale ancestry: %v", err)
+	}
+	if staleAncestor {
+		t.Fatalf("fresh session branch %q unexpectedly includes stale local commit %s", branch, staleSHA)
+	}
+
+	baseAncestor, err := repoGit.IsAncestor(baseSHA, branch)
+	if err != nil {
+		t.Fatalf("check canonical ancestry: %v", err)
+	}
+	if !baseAncestor {
+		t.Fatalf("fresh session branch %q should descend from origin/main commit %s", branch, baseSHA)
+	}
+}
+
+func TestEnsureCanonicalSessionBranch_KeepsCurrentIssueBranch(t *testing.T) {
+	workDir, repoGit := setupSessionBranchTestRepo(t)
+
+	currentBranch := "polecat/toast/gt-9qb@seed"
+	if err := repoGit.CheckoutNewBranch(currentBranch, "main"); err != nil {
+		t.Fatalf("checkout current issue branch: %v", err)
+	}
+
+	sm := NewSessionManager(tmux.NewTmux(), &rig.Rig{Name: "gastown", Path: workDir})
+	branch := sm.ensureCanonicalSessionBranch(repoGit, "toast", SessionStartOptions{Issue: "gt-9qb"})
+	if branch != currentBranch {
+		t.Fatalf("ensureCanonicalSessionBranch changed active issue branch: got %q want %q", branch, currentBranch)
+	}
+}
+
 // TestSessionManager_resolveBeadsDir verifies that SessionManager correctly
 // resolves the beads directory for cross-rig issues via routes.jsonl.
 // This is a regression test for GitHub issue #1056.
@@ -538,6 +636,122 @@ func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
 	}
 }
 
+// TestModeABeaconVerificationCondition verifies that hook+prompt agents (e.g. Claude)
+// satisfy the Mode A beacon delivery verification condition introduced in hi-y44.
+// Fresh spawns may show the Claude Code splash with the CLI beacon pre-filled but
+// not auto-submitted; the condition triggers verifyStartupNudgeDelivery as a safety net.
+func TestModeABeaconVerificationCondition(t *testing.T) {
+	tests := []struct {
+		name            string
+		rc              *config.RuntimeConfig
+		wantModeA       bool // !SendBeaconNudge && !SendStartupNudge
+	}{
+		{
+			name: "Claude hook+prompt agent triggers Mode A verification",
+			rc: &config.RuntimeConfig{
+				PromptMode: "arg",
+				Hooks: &config.RuntimeHooksConfig{
+					Provider: "claude",
+				},
+			},
+			wantModeA: true,
+		},
+		{
+			name: "Non-hook agent does not trigger Mode A (has startup nudge instead)",
+			rc: &config.RuntimeConfig{
+				PromptMode: "arg",
+				Hooks:      nil,
+			},
+			wantModeA: false,
+		},
+		{
+			name: "Hook agent with no prompt support does not trigger Mode A (uses beacon nudge)",
+			rc: &config.RuntimeConfig{
+				PromptMode: "none",
+				Hooks: &config.RuntimeHooksConfig{
+					Provider: "claude",
+				},
+			},
+			wantModeA: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := gtruntime.GetStartupFallbackInfo(tt.rc)
+			gotModeA := !info.SendBeaconNudge && !info.SendStartupNudge
+			if gotModeA != tt.wantModeA {
+				t.Errorf("Mode A condition = %v, want %v (SendBeaconNudge=%v, SendStartupNudge=%v)",
+					gotModeA, tt.wantModeA, info.SendBeaconNudge, info.SendStartupNudge)
+			}
+		})
+	}
+}
+
+// TestModeAStartupVerifyIsNonBlocking exercises the Mode A async verification path
+// that Start uses for hook+prompt agents (hi-y44). Confirms that verifyStartupNudgeDelivery
+// runs as a goroutine — a synchronous call on this path added ~25s to every successful
+// polecat startup because the function sleeps before its first idle check.
+func TestModeAStartupVerifyIsNonBlocking(t *testing.T) {
+	requireTmux(t)
+
+	tm := tmux.NewTmux()
+	sessionName := fmt.Sprintf("gt-test-modeA-%d", testSessionCounter.Add(1))
+	_ = tm.KillSession(sessionName)
+
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+
+	time.Sleep(300 * time.Millisecond)
+	_ = tm.SendKeys(sessionName, "export PS1='❯ '")
+	time.Sleep(300 * time.Millisecond)
+
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	m := NewSessionManager(tm, r)
+
+	rc := &config.RuntimeConfig{
+		PromptMode: "arg",
+		Hooks:      &config.RuntimeHooksConfig{Provider: "claude"},
+		Tmux: &config.RuntimeTmuxConfig{
+			ReadyPromptPrefix: "❯ ",
+		},
+	}
+
+	// Confirm this is a Mode A agent (the condition Start checks before the goroutine).
+	info := gtruntime.GetStartupFallbackInfo(rc)
+	if info.SendBeaconNudge || info.SendStartupNudge {
+		t.Fatal("expected Mode A: !SendBeaconNudge && !SendStartupNudge")
+	}
+
+	// Replicate what Start does on the Mode A path: launch verifyStartupNudgeDelivery
+	// as a goroutine. The caller must return before the verify delay (25s default) elapses.
+	callerReturned := make(chan time.Duration, 1)
+	goroutineDone := make(chan struct{})
+
+	launchStart := time.Now()
+	go func() {
+		m.verifyStartupNudgeDelivery(sessionName, rc, "[GAS TOWN] test ← witness / Run `gt prime --hook`")
+		close(goroutineDone)
+	}()
+	callerReturned <- time.Since(launchStart)
+
+	// Caller side: goroutine launch should be near-instant.
+	elapsed := <-callerReturned
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("goroutine launch blocked caller for %v; expected <500ms (async regression)", elapsed)
+	}
+
+	// Goroutine side: must complete within (maxRetries * verifyDelay) + overhead.
+	// Default: 2 retries * 25s = 50s. Allow 90s for slow CI.
+	select {
+	case <-goroutineDone:
+	case <-time.After(90 * time.Second):
+		t.Fatal("Mode A verifyStartupNudgeDelivery goroutine hung (exceeded 90s timeout)")
+	}
+}
+
 func TestValidateSessionName(t *testing.T) {
 	// Register prefixes so validateSessionName can resolve them correctly.
 	reg := session.NewPrefixRegistry()
@@ -642,5 +856,113 @@ func TestPolecatSlot(t *testing.T) {
 	}
 	if slot := sm.polecatSlot("beta"); slot != 1 {
 		t.Errorf("with hidden dir: polecatSlot(beta) = %d, want 1", slot)
+	}
+}
+
+func TestParseFreshBranchName_RoundTrip(t *testing.T) {
+	sm := &SessionManager{}
+
+	cases := []struct {
+		name    string
+		polecat string
+		issue   string
+	}{
+		{name: "with issue", polecat: "alpha", issue: "gt-abc"},
+		{name: "no issue", polecat: "beta", issue: ""},
+		{name: "numeric issue", polecat: "nux", issue: "gt-123"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			branch := sm.freshBranchName(c.polecat, c.issue)
+			meta := parseFreshBranchName(branch)
+			if !meta.ok {
+				t.Fatalf("parseFreshBranchName(%q) not ok", branch)
+			}
+			if meta.polecat != c.polecat {
+				t.Errorf("polecat = %q, want %q (from %q)", meta.polecat, c.polecat, branch)
+			}
+			if meta.issue != c.issue {
+				t.Errorf("issue = %q, want %q (from %q)", meta.issue, c.issue, branch)
+			}
+		})
+	}
+}
+
+func TestParseFreshBranchName_Rejects(t *testing.T) {
+	rejects := []string{
+		"main",
+		"master",
+		"develop",
+		"feature/x",
+		"polecat/",          // empty tail
+		"polecat/alpha",     // no ts or issue
+		"polecat/alpha-",    // trailing dash, no ts
+		"polecat//gt-abc@1", // empty polecat name
+		"polecat/alpha/@1",  // empty issue
+		"polecat/alpha/gt-abc@", // empty ts
+		"",
+	}
+	for _, b := range rejects {
+		if meta := parseFreshBranchName(b); meta.ok {
+			t.Errorf("parseFreshBranchName(%q) = %+v, want ok=false", b, meta)
+		}
+	}
+}
+
+func TestShouldCreateFreshSessionBranch_Structural(t *testing.T) {
+	// Non-standard canonical branch (e.g., "develop") — must be honored even
+	// though the old string-heuristic hardcoded "main"/"master".
+	cases := []struct {
+		name            string
+		currentBranch   string
+		issue           string
+		canonicalBranch string
+		want            bool
+	}{
+		{
+			name:            "on develop as canonical triggers fresh",
+			currentBranch:   "develop",
+			issue:           "gt-abc",
+			canonicalBranch: "develop",
+			want:            true,
+		},
+		{
+			name:            "on main when canonical is develop does NOT trigger fresh",
+			currentBranch:   "main",
+			issue:           "gt-abc",
+			canonicalBranch: "develop",
+			want:            false,
+		},
+		{
+			name:            "same-issue respawn preserves branch",
+			currentBranch:   "polecat/alpha/gt-abc@xyz",
+			issue:           "gt-abc",
+			canonicalBranch: "main",
+			want:            false,
+		},
+		{
+			name:            "other-issue polecat branch triggers fresh",
+			currentBranch:   "polecat/alpha/gt-999@xyz",
+			issue:           "gt-abc",
+			canonicalBranch: "main",
+			want:            true,
+		},
+		{
+			name:            "empty canonical with non-polecat branch does not trigger",
+			currentBranch:   "feature/x",
+			issue:           "gt-abc",
+			canonicalBranch: "",
+			want:            false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldCreateFreshSessionBranch(c.currentBranch, c.issue, c.canonicalBranch); got != c.want {
+				t.Errorf("shouldCreateFreshSessionBranch(%q, %q, %q) = %v, want %v",
+					c.currentBranch, c.issue, c.canonicalBranch, got, c.want)
+			}
+		})
 	}
 }

@@ -299,8 +299,14 @@ func init() {
 }
 
 // getDogManager creates a dog.Manager with the current town root.
+//
+// Use FindFromCwdOrError so we honor GT_TOWN_ROOT/GT_ROOT env vars when
+// invoked from a dog worktree (e.g. ~/gt/deacon/dogs/alpha/<rig>/), where
+// FindFromCwd alone might walk up to a non-town ancestor or stop at a path
+// without mayor/rigs.json — which previously broke `gt dog done` and
+// blocked DOG_DONE delivery (hq-zyvo).
 func getDogManager() (*dog.Manager, error) {
-	townRoot, err := workspace.FindFromCwd()
+	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return nil, fmt.Errorf("finding town root: %w", err)
 	}
@@ -750,10 +756,18 @@ func closePluginMails(dogName string) {
 
 	closed := 0
 	for _, msg := range messages {
-		if msg.Read {
+		// Archive read AND unread direct plugin dispatch mail. The dog must read
+		// the dispatch mail to execute the plugin, so skipping read mail left
+		// every executed dispatch bead open forever. Keep this scoped to Deacon
+		// dispatches so CC or human messages with a similar subject are preserved.
+		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
 			continue
 		}
-		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
+		if mail.AddressToIdentity(msg.To) != mail.AddressToIdentity(dogAddress) {
+			continue
+		}
+		sender := mail.AddressToIdentity(msg.From)
+		if sender != "deacon/" && sender != "daemon" {
 			continue
 		}
 		if archErr := mailbox.Archive(msg.ID); archErr == nil {
@@ -1268,4 +1282,3 @@ func ifStr(cond bool, ifTrue, ifFalse string) string {
 	}
 	return ifFalse
 }
-

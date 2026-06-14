@@ -135,6 +135,43 @@ func TestDiscoverRigs(t *testing.T) {
 	}
 }
 
+func TestDiscoverRigs_SortedByName(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+
+	// Register rigs in deliberately non-alphabetical order.
+	// Go map iteration is randomized, so without sorting the output
+	// order would be nondeterministic across runs.
+	names := []string{"zebra", "alpha", "middle", "beta"}
+	for _, name := range names {
+		createTestRig(t, root, name)
+		rigsConfig.Rigs[name] = config.RigEntry{
+			GitURL: "git@github.com:test/" + name + ".git",
+		}
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+
+	// Run multiple iterations to catch nondeterminism — a single pass
+	// could accidentally return sorted order from a random map.
+	for i := 0; i < 10; i++ {
+		rigs, err := manager.DiscoverRigs()
+		if err != nil {
+			t.Fatalf("DiscoverRigs (iter %d): %v", i, err)
+		}
+
+		if len(rigs) != len(names) {
+			t.Fatalf("iter %d: rigs count = %d, want %d", i, len(rigs), len(names))
+		}
+
+		want := []string{"alpha", "beta", "middle", "zebra"}
+		for j, rig := range rigs {
+			if rig.Name != want[j] {
+				t.Errorf("iter %d: rigs[%d].Name = %q, want %q", i, j, rig.Name, want[j])
+			}
+		}
+	}
+}
+
 func TestGetRig(t *testing.T) {
 	root, rigsConfig := setupTestTown(t)
 
@@ -286,6 +323,142 @@ func TestAddRig_RejectsInvalidNames(t *testing.T) {
 				t.Errorf("AddRig(%q) error = %q, want error containing %q", tt.name, err.Error(), tt.wantError)
 			}
 		})
+	}
+}
+
+func TestAddRig_EmptyRepositoryReturnsFriendlyError(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	remoteDir := filepath.Join(t.TempDir(), "empty-remote")
+	if err := os.MkdirAll(remoteDir, 0755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
+	}
+	cmd := exec.Command("git", "init")
+	cmd.Dir = remoteDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "emptyrepo",
+		GitURL:        remoteDir,
+		BeadsPrefix:   "er",
+		SkipDoltCheck: true,
+	})
+	if err == nil {
+		t.Fatal("AddRig succeeded, want empty repository error")
+	}
+	want := fmt.Sprintf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", remoteDir)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("AddRig error = %q, want containing %q", err.Error(), want)
+	}
+	if strings.Contains(err.Error(), "couldn't find remote ref") {
+		t.Fatalf("AddRig surfaced low-level fetch error: %q", err.Error())
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "emptyrepo")); !os.IsNotExist(statErr) {
+		t.Fatalf("expected failed rig directory to be removed, stat err = %v", statErr)
+	}
+}
+
+func TestAddRig_EmptyRepositoryWithBranchReturnsFriendlyError(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	remoteDir := filepath.Join(t.TempDir(), "empty-remote")
+	if err := os.MkdirAll(remoteDir, 0755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
+	}
+	cmd := exec.Command("git", "init")
+	cmd.Dir = remoteDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "emptybranchrepo",
+		GitURL:        remoteDir,
+		BeadsPrefix:   "ebr",
+		DefaultBranch: "main",
+		SkipDoltCheck: true,
+	})
+	if err == nil {
+		t.Fatal("AddRig succeeded, want empty repository error")
+	}
+	want := fmt.Sprintf("repository %s is empty (no commits). Push at least one commit before adding it as a rig", remoteDir)
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("AddRig error = %q, want containing %q", err.Error(), want)
+	}
+	if strings.Contains(err.Error(), "Remote branch main not found") {
+		t.Fatalf("AddRig surfaced low-level clone error: %q", err.Error())
+	}
+}
+
+func TestAddRig_NonEmptyRepositoryWithBadHeadIsNotReportedAsEmpty(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	tmp := t.TempDir()
+	remoteDir := filepath.Join(tmp, "remote.git")
+	workDir := filepath.Join(tmp, "work")
+	for _, args := range [][]string{
+		{"git", "init", "--bare", "--initial-branch=main", remoteDir},
+		{"git", "clone", remoteDir, workDir},
+		{"git", "-C", workDir, "config", "user.email", "test@test.com"},
+		{"git", "-C", workDir, "config", "user.name", "Test User"},
+		{"git", "-C", workDir, "commit", "--allow-empty", "-m", "init"},
+		{"git", "-C", workDir, "push", "origin", "HEAD:refs/heads/main"},
+		{"git", "--git-dir", remoteDir, "symbolic-ref", "HEAD", "refs/heads/missing"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "badheadrepo",
+		GitURL:        remoteDir,
+		BeadsPrefix:   "bhr",
+		SkipDoltCheck: true,
+	})
+	if err == nil {
+		t.Fatal("AddRig succeeded, want bad remote HEAD error")
+	}
+	if strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("AddRig reported non-empty bad-HEAD repo as empty: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "has refs, but no default branch could be cloned") {
+		t.Fatalf("AddRig error = %q, want bad remote HEAD diagnostic", err.Error())
+	}
+}
+
+func TestAddRig_TagOnlyRepositoryIsNotReportedAsEmpty(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+	repoDir := filepath.Join(t.TempDir(), "tag-only")
+	for _, args := range [][]string{
+		{"git", "init", "--initial-branch=main", repoDir},
+		{"git", "-C", repoDir, "config", "user.email", "test@test.com"},
+		{"git", "-C", repoDir, "config", "user.name", "Test User"},
+		{"git", "-C", repoDir, "commit", "--allow-empty", "-m", "init"},
+		{"git", "-C", repoDir, "tag", "v1"},
+		{"git", "-C", repoDir, "update-ref", "-d", "refs/heads/main"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, err := manager.AddRig(AddRigOptions{
+		Name:          "tagonlyrepo",
+		GitURL:        repoDir,
+		BeadsPrefix:   "tor",
+		SkipDoltCheck: true,
+	})
+	if err == nil {
+		t.Fatal("AddRig succeeded, want no branch error")
+	}
+	if strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("AddRig reported tag-only repo as empty: %q", err.Error())
 	}
 }
 
@@ -495,7 +668,7 @@ exit 1
 	t.Setenv("BEADS_DIR_LOG", beadsDirLog)
 
 	manager := &Manager{}
-	if err := manager.InitBeads(rigPath, "gt", ""); err != nil {
+	if err := manager.InitBeads(rigPath, "gt", "testrig"); err != nil {
 		t.Fatalf("initBeads: %v", err)
 	}
 
@@ -507,6 +680,22 @@ exit 1
 	want := "prefix: gt\nissue-prefix: gt\ndolt.idle-timeout: \"0\"\n"
 	if string(config) != want {
 		t.Fatalf("config.yaml = %q, want %q", string(config), want)
+	}
+
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	metadataBytes, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatalf("reading metadata.json: %v", err)
+	}
+	var metadata map[string]interface{}
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		t.Fatalf("parsing metadata.json: %v", err)
+	}
+	if metadata["dolt_mode"] != "server" {
+		t.Fatalf("dolt_mode = %v, want server", metadata["dolt_mode"])
+	}
+	if metadata["dolt_database"] != "testrig" {
+		t.Fatalf("dolt_database = %v, want testrig", metadata["dolt_database"])
 	}
 	assertBeadsDirLog(t, beadsDirLog, beadsDir)
 }
@@ -550,6 +739,50 @@ exit 0
 	// Verify bd config set issue_prefix was called with the correct prefix
 	if !strings.Contains(cmds, "config set issue_prefix myrig") {
 		t.Errorf("expected 'bd config set issue_prefix myrig' in commands log, got:\n%s", cmds)
+	}
+}
+
+func TestInitBeadsPassesCanonicalDatabase(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd arg/env logging is shell-specific")
+	}
+
+	rigPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rigPath, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
+	script := `#!/usr/bin/env bash
+set -e
+printf 'args=%s env=%s beads=%s db=%s\n' "$*" "${BEADS_DOLT_SERVER_DATABASE:-<unset>}" "${BEADS_DIR:-<unset>}" "${BEADS_DB:-<unset>}" >> "$BD_CMD_LOG"
+exit 0
+`
+	binDir := writeFakeBD(t, script, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_CMD_LOG", cmdLog)
+	t.Setenv("BEADS_DIR", filepath.Join(rigPath, "wrong", ".beads"))
+	t.Setenv("BEADS_DB", filepath.Join(rigPath, "wrong.db"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "stale_prefix_db")
+
+	manager := &Manager{}
+	if err := manager.InitBeads(rigPath, "xx", "my_project"); err != nil {
+		t.Fatalf("InitBeads: %v", err)
+	}
+
+	logData, err := os.ReadFile(cmdLog)
+	if err != nil {
+		t.Fatalf("reading command log: %v", err)
+	}
+	cmds := string(logData)
+	if !strings.Contains(cmds, "args=init --prefix xx --database my_project --server") {
+		t.Fatalf("bd init did not use canonical database; log:\n%s", cmds)
+	}
+	if strings.Contains(cmds, "env=stale_prefix_db") || strings.Contains(cmds, "wrong.db") || strings.Contains(cmds, filepath.Join(rigPath, "wrong", ".beads")) {
+		t.Fatalf("stale BEADS env leaked into bd subprocess; log:\n%s", cmds)
+	}
+	if !strings.Contains(cmds, "env=my_project") {
+		t.Fatalf("bd subprocess did not receive canonical database env; log:\n%s", cmds)
 	}
 }
 
@@ -697,6 +930,110 @@ func TestIsValidBeadsPrefix(t *testing.T) {
 				t.Errorf("isValidBeadsPrefix(%q) = %v, want %v", tt.prefix, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDropRigOrphanDBs_RemovesPrefixDB is the regression test for gh#3562.
+//
+// `bd init --prefix <prefix> --server` creates a Dolt database whose name
+// matches the prefix exactly (e.g. "ma" for prefix=ma) on bd >= 0.62. The rig
+// uses <rigName> as its canonical database, so the prefix-named DB is an
+// orphan that must be removed — otherwise beads created from the rig land in
+// the orphan while the mayor reads from <rigName>, silently splitting the data.
+//
+// This test simulates the post-init filesystem state, runs the orphan dropper,
+// and asserts that exactly one rig database remains on disk.
+func TestDropRigOrphanDBs_RemovesPrefixDB(t *testing.T) {
+	// Disable the running-server check so RemoveDatabase falls through to
+	// pure filesystem cleanup. Pointing GT_DOLT_PORT at a definitely-unused
+	// port keeps the test independent of any real Dolt server on the host.
+	t.Setenv("GT_DOLT_PORT", "1") // privileged port, definitely not running dolt
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	const rigName = "mobile_apps"
+	const prefix = "ma"
+
+	// Simulate post-init state: rigName DB (correct) and prefix DB (orphan).
+	for _, db := range []string{rigName, prefix} {
+		doltDir := filepath.Join(dataDir, db, ".dolt")
+		if err := os.MkdirAll(doltDir, 0755); err != nil {
+			t.Fatalf("seed %s: %v", db, err)
+		}
+	}
+
+	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
+		t.Fatalf("dropRigOrphanDBs: %v", err)
+	}
+
+	// Orphan must be gone.
+	if _, err := os.Stat(filepath.Join(dataDir, prefix)); !os.IsNotExist(err) {
+		t.Errorf("prefix DB %q should have been removed; stat err = %v", prefix, err)
+	}
+
+	// Canonical rig DB must remain.
+	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
+		t.Errorf("rig DB %q should be preserved; stat err = %v", rigName, err)
+	}
+}
+
+// TestDropRigOrphanDBs_RemovesLegacyBeadsPrefixDB covers the bd < 0.62
+// naming convention where bd init created "beads_<prefix>" instead of
+// "<prefix>". Both forms must be cleaned up to keep older workspaces
+// functional after upgrade.
+func TestDropRigOrphanDBs_RemovesLegacyBeadsPrefixDB(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	const rigName = "mobile_apps"
+	const prefix = "ma"
+	const legacyOrphan = "beads_ma"
+
+	for _, db := range []string{rigName, legacyOrphan} {
+		if err := os.MkdirAll(filepath.Join(dataDir, db, ".dolt"), 0755); err != nil {
+			t.Fatalf("seed %s: %v", db, err)
+		}
+	}
+
+	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
+		t.Fatalf("dropRigOrphanDBs: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, legacyOrphan)); !os.IsNotExist(err) {
+		t.Errorf("legacy orphan %q should have been removed; stat err = %v", legacyOrphan, err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
+		t.Errorf("rig DB %q should be preserved; stat err = %v", rigName, err)
+	}
+}
+
+// TestDropRigOrphanDBs_PreservesRigDB is the safety check that the helper
+// never removes a database whose name happens to match the prefix when the
+// rig itself is named after its prefix (e.g. rig "gastown" with prefix "gt"
+// where neither candidate is an orphan).
+func TestDropRigOrphanDBs_PreservesRigDB(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	// Pathological case: rigName == prefix. Nothing should be dropped.
+	const rigName = "gt"
+	const prefix = "gt"
+
+	if err := os.MkdirAll(filepath.Join(dataDir, rigName, ".dolt"), 0755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
+		t.Fatalf("dropRigOrphanDBs: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
+		t.Errorf("rig DB %q must be preserved when prefix == rigName; stat err = %v", rigName, err)
 	}
 }
 
@@ -1561,5 +1898,229 @@ func TestBareCloneDefaultBranch(t *testing.T) {
 	g := git.NewGit(bareDir)
 	if got := g.DefaultBranch(); got != "master" {
 		t.Errorf("DefaultBranch() = %q, want %q", got, "master")
+	}
+}
+
+func TestBeadsConfigHasSyncRemote(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		configYAML string
+		want       bool
+	}{
+		{
+			name:       "sync.remote present",
+			configYAML: "sync.remote: \"git+https://github.com/example/repo.git\"\n",
+			want:       true,
+		},
+		{
+			name:       "sync.remote with single quotes",
+			configYAML: "sync.remote: 'git+ssh://git@github.com/example/repo.git'\n",
+			want:       true,
+		},
+		{
+			name:       "sync.remote empty value",
+			configYAML: "sync.remote: \"\"\n",
+			want:       false,
+		},
+		{
+			name:       "sync.remote absent",
+			configYAML: "prefix: gt\nissue-prefix: gt\n",
+			want:       false,
+		},
+		{
+			name:       "sync.remote commented out",
+			configYAML: "# sync.remote: git+https://example.com/repo.git\nprefix: gt\n",
+			want:       false,
+		},
+		{
+			name:       "sync.remote with prefix and other keys",
+			configYAML: "prefix: gt\nsync.remote: git+https://github.com/org/repo.git\ndolt.idle-timeout: \"0\"\n",
+			want:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yaml")
+			if err := os.WriteFile(configPath, []byte(tt.configYAML), 0644); err != nil {
+				t.Fatalf("writing config: %v", err)
+			}
+			got := beadsConfigHasSyncRemote(configPath)
+			if got != tt.want {
+				t.Errorf("beadsConfigHasSyncRemote() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBeadsConfigHasSyncRemote_MissingFile(t *testing.T) {
+	t.Parallel()
+	got := beadsConfigHasSyncRemote("/nonexistent/path/config.yaml")
+	if got {
+		t.Error("beadsConfigHasSyncRemote() = true for missing file, want false")
+	}
+}
+
+func TestAddRig_TrackedBeadsWithSyncRemote_PassesReinitFlags(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based bd shim not reliable on Windows CI")
+	}
+
+	// Fake bd that succeeds on all subcommands and logs bd init args.
+	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
+	script := `#!/usr/bin/env bash
+cmd="$1"
+[[ "$cmd" == "--allow-stale" ]] && { shift; cmd="$1"; }
+shift
+if [[ "$cmd" == "init" ]]; then
+  echo "init $*" >> "$BD_CMD_LOG"
+fi
+case "$cmd" in
+  init|config|migrate) exit 0 ;;
+  show) echo "[]" ;;
+  create)
+    id=""; title=""
+    for arg in "$@"; do
+      case "$arg" in --id=*) id="${arg#--id=}" ;; --title=*) title="${arg#--title=}" ;; esac
+    done
+    printf '{"id":"%s","title":"%s","description":"","issue_type":"agent"}' "$id" "$title"
+    ;;
+  *) exit 0 ;;
+esac
+`
+	binDir := writeFakeBD(t, script, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_CMD_LOG", cmdLog)
+
+	// Create a git repo with .beads/config.yaml containing sync.remote.
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	configYAML := "prefix: gt\nsync.remote: \"git+https://github.com/steveyegge/gastown.git\"\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configYAML), 0644); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+	for _, args := range [][]string{
+		{"git", "init", "--initial-branch=main", repoDir},
+		{"git", "-C", repoDir, "config", "user.email", "test@test.com"},
+		{"git", "-C", repoDir, "config", "user.name", "Test User"},
+		{"git", "-C", repoDir, "add", "."},
+		{"git", "-C", repoDir, "commit", "-m", "Initial commit with beads config"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+
+	root, rigsConfig := setupTestTown(t)
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+
+	// AddRig may fail after the bd init step (e.g. Dolt not running); that's fine.
+	// We only care that bd init was called with the right flags.
+	_, _ = manager.AddRig(AddRigOptions{
+		Name:          "testrip",
+		GitURL:        repoDir,
+		BeadsPrefix:   "gt",
+		SkipDoltCheck: true,
+	})
+
+	logData, err := os.ReadFile(cmdLog)
+	if err != nil {
+		t.Fatalf("reading bd cmd log: %v", err)
+	}
+	cmds := string(logData)
+
+	if !strings.Contains(cmds, "--reinit-local") {
+		t.Errorf("bd init missing --reinit-local; full log:\n%s", cmds)
+	}
+	if !strings.Contains(cmds, "--discard-remote") {
+		t.Errorf("bd init missing --discard-remote; full log:\n%s", cmds)
+	}
+	if !strings.Contains(cmds, "--destroy-token=DESTROY-gt") {
+		t.Errorf("bd init missing --destroy-token=DESTROY-gt; full log:\n%s", cmds)
+	}
+}
+
+func TestAddRig_TrackedBeadsWithoutSyncRemote_NoReinitFlags(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based bd shim not reliable on Windows CI")
+	}
+
+	// Fake bd that logs bd init args.
+	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
+	script := `#!/usr/bin/env bash
+cmd="$1"
+[[ "$cmd" == "--allow-stale" ]] && { shift; cmd="$1"; }
+shift
+if [[ "$cmd" == "init" ]]; then
+  echo "init $*" >> "$BD_CMD_LOG"
+fi
+case "$cmd" in
+  init|config|migrate) exit 0 ;;
+  show) echo "[]" ;;
+  create)
+    id=""; title=""
+    for arg in "$@"; do
+      case "$arg" in --id=*) id="${arg#--id=}" ;; --title=*) title="${arg#--title=}" ;; esac
+    done
+    printf '{"id":"%s","title":"%s","description":"","issue_type":"agent"}' "$id" "$title"
+    ;;
+  *) exit 0 ;;
+esac
+`
+	binDir := writeFakeBD(t, script, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_CMD_LOG", cmdLog)
+
+	// Create a git repo with .beads/config.yaml without sync.remote.
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	configYAML := "prefix: gt\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configYAML), 0644); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+	for _, args := range [][]string{
+		{"git", "init", "--initial-branch=main", repoDir},
+		{"git", "-C", repoDir, "config", "user.email", "test@test.com"},
+		{"git", "-C", repoDir, "config", "user.name", "Test User"},
+		{"git", "-C", repoDir, "add", "."},
+		{"git", "-C", repoDir, "commit", "-m", "Initial commit"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v\n%s", args, err, out)
+		}
+	}
+
+	root, rigsConfig := setupTestTown(t)
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+	_, _ = manager.AddRig(AddRigOptions{
+		Name:          "testrip",
+		GitURL:        repoDir,
+		BeadsPrefix:   "gt",
+		SkipDoltCheck: true,
+	})
+
+	logData, err := os.ReadFile(cmdLog)
+	if err != nil {
+		// No bd init calls logged means the test is inconclusive; skip.
+		t.Skip("bd init was not logged (may have been skipped due to bdDatabaseExists check)")
+	}
+	cmds := string(logData)
+	if strings.Contains(cmds, "--reinit-local") {
+		t.Errorf("bd init should NOT have --reinit-local without sync.remote; got:\n%s", cmds)
+	}
+	if strings.Contains(cmds, "--discard-remote") {
+		t.Errorf("bd init should NOT have --discard-remote without sync.remote; got:\n%s", cmds)
 	}
 }

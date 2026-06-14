@@ -539,23 +539,22 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 		return fmt.Errorf("building startup command: %w", err)
 	}
 
-	// Create session with command directly to avoid send-keys race condition.
-	// See: https://github.com/anthropics/gastown/issues/280
-	fmt.Println("Starting Deacon session...")
-	if err := t.NewSessionWithCommand(sessionName, deaconDir, startupCmd); err != nil {
-		return fmt.Errorf("creating session: %w", err)
-	}
-
-	// Set environment (non-fatal: session works without these)
-	// Use centralized AgentEnv for consistency across all role startup paths
+	// Compute env vars BEFORE creating the session so they reach the agent's
+	// subprocesses (e.g., bd) via tmux -e flags. SetEnvironment after creation
+	// only affects newly spawned panes, not the running pane's tree (gt-neycp).
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:             "deacon",
 		TownRoot:         townRoot,
 		RuntimeConfigDir: runtimeConfigDir,
 		Agent:            agentOverride,
 	})
-	for k, v := range envVars {
-		_ = t.SetEnvironment(sessionName, k, v)
+
+	// Create session with command and env vars via -e flags so the initial
+	// shell (and subprocesses Claude spawns) inherit them from the start.
+	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
+	fmt.Println("Starting Deacon session...")
+	if err := t.NewSessionWithCommandAndEnv(sessionName, deaconDir, startupCmd, envVars); err != nil {
+		return fmt.Errorf("creating session: %w", err)
 	}
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
@@ -828,15 +827,12 @@ func runDeaconHeartbeat(cmd *cobra.Command, args []string) error {
 		action = strings.Join(args, " ")
 	}
 
+	if err := syncDeaconHeartbeatStores(townRoot, action); err != nil {
+		return fmt.Errorf("updating heartbeat: %w", err)
+	}
 	if action != "" {
-		if err := deacon.TouchWithAction(townRoot, action, 0, 0); err != nil {
-			return fmt.Errorf("updating heartbeat: %w", err)
-		}
 		fmt.Printf("%s Heartbeat updated: %s\n", style.Bold.Render("✓"), action)
 	} else {
-		if err := deacon.Touch(townRoot); err != nil {
-			return fmt.Errorf("updating heartbeat: %w", err)
-		}
 		fmt.Printf("%s Heartbeat updated\n", style.Bold.Render("✓"))
 	}
 
@@ -898,17 +894,21 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("sending health check nudge: %w", err)
 	}
 
-	// Get baseline time AFTER sending nudge to avoid false positives.
-	// If we get the time before the nudge and the bead doesn't exist (time.Time{}),
-	// any subsequent update would incorrectly appear as a response.
-	// By getting the baseline after the nudge, we ensure we're only detecting
-	// activity that happens in response to our health check.
+	// Get baseline times AFTER sending nudge to avoid false positives.
+	// By sampling after the nudge, we only detect activity caused by our check.
 	baselineTime, err := getAgentBeadUpdateTime(townRoot, beadID)
 	if err != nil {
 		// Bead might not exist yet - use current time as baseline
 		// This way only updates AFTER this point count as responses
 		baselineTime = time.Now()
 	}
+
+	// Also capture baseline tmux session activity time.
+	// This is the secondary response signal: if the session shows new output
+	// after our nudge, the agent is alive and processing — even if it hasn't
+	// updated its bead (e.g., witness agents that respond in prose rather than
+	// via a structured bead-update channel).
+	baselineActivity, activityErr := t.GetSessionActivity(sessionName)
 
 	fmt.Printf("%s Sent HEALTH_CHECK to %s, waiting %s...\n",
 		style.Bold.Render("→"), agent, healthCheckTimeout)
@@ -928,15 +928,23 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 		case <-ctx.Done():
 			goto Done
 		case <-ticker.C:
+			// Primary signal: bead update (structured response channel)
 			newTime, err := getAgentBeadUpdateTime(townRoot, beadID)
-			if err != nil {
-				continue
-			}
-
-			// If bead was updated after our baseline, agent responded
-			if newTime.After(baselineTime) {
+			if err == nil && newTime.After(baselineTime) {
 				responded = true
 				goto Done
+			}
+
+			// Secondary signal: tmux session activity (prose/command response)
+			// Agents like the Witness respond to HEALTH_CHECK by running commands
+			// in their session, producing output, but may not update their bead.
+			// Session activity is a reliable liveness signal for these agents.
+			if activityErr == nil {
+				newActivity, err := t.GetSessionActivity(sessionName)
+				if err == nil && newActivity.After(baselineActivity) {
+					responded = true
+					goto Done
+				}
 			}
 		}
 	}
@@ -1303,6 +1311,13 @@ func runDeaconPause(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("pausing Deacon: %w", err)
 	}
 
+	// Write agent_state=paused to the Deacon bead so the stuck-agent-dog plugin
+	// (and other ZFC readers) see authoritative pause state without inferring
+	// from heartbeat mtime. hq-sa8de Phase A.
+	if err := beads.New(townRoot).UpdateAgentState(beads.DeaconBeadIDTown(), string(beads.AgentStatePaused)); err != nil {
+		style.PrintWarning("could not sync agent_state=paused to Deacon bead: %v", err)
+	}
+
 	fmt.Printf("%s Deacon paused\n", style.Bold.Render("⏸️"))
 	if pauseReason != "" {
 		fmt.Printf("  Reason: %s\n", pauseReason)
@@ -1335,6 +1350,12 @@ func runDeaconResume(cmd *cobra.Command, args []string) error {
 	// Resume the Deacon
 	if err := deacon.Resume(townRoot); err != nil {
 		return fmt.Errorf("resuming Deacon: %w", err)
+	}
+
+	// Write agent_state=idle to the Deacon bead. The Deacon will transition to
+	// patrolling on its next cycle. hq-sa8de Phase A.
+	if err := beads.New(townRoot).UpdateAgentState(beads.DeaconBeadIDTown(), string(beads.AgentStateIdle)); err != nil {
+		style.PrintWarning("could not sync agent_state=idle to Deacon bead: %v", err)
 	}
 
 	fmt.Printf("%s Deacon resumed\n", style.Bold.Render("▶️"))

@@ -121,6 +121,18 @@ type Daemon struct {
 	// polecat health, idle reaping, branch pruning) with bounded concurrency and
 	// per-rig context timeouts so one slow rig cannot block all others.
 	rigPool *RigWorkerPool
+
+	// knownRigsCache memoizes the result of reading mayor/rigs.json for the
+	// duration of a single heartbeat tick. ~10 call sites per tick otherwise
+	// re-read and re-parse the same file. Invalidated at the start of each
+	// heartbeat so rigs.json changes between ticks are picked up.
+	// Only accessed from heartbeat loop goroutine - no sync needed.
+	knownRigsCache      []string
+	knownRigsCacheValid bool
+
+	// legacySocketCleanupOnce ensures upgrade cleanup only runs once per daemon
+	// lifetime, before any patrol agent can be started on the current socket.
+	legacySocketCleanupOnce sync.Once
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -145,6 +157,63 @@ const beadsModulePath = "github.com/steveyegge/beads"
 
 var semverPattern = regexp.MustCompile(`v?(\d+\.\d+\.\d+)`)
 
+func daemonPathCandidates(home, exePath string) []string {
+	candidates := make([]string, 0, 5)
+	if exePath != "" {
+		candidates = append(candidates, filepath.Dir(exePath))
+	}
+	if home != "" {
+		candidates = append(candidates,
+			filepath.Join(home, ".local/bin"),
+			filepath.Join(home, "bin"),
+		)
+	}
+	return append(candidates,
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+	)
+}
+
+func augmentDaemonPath(logger *log.Logger) {
+	exePath := ""
+	if exe, err := os.Executable(); err == nil {
+		exePath = exe
+	}
+	extras := daemonPathCandidates(os.Getenv("HOME"), exePath)
+	if len(extras) == 0 {
+		return
+	}
+
+	current := os.Getenv("PATH")
+	parts := strings.Split(current, string(os.PathListSeparator))
+	seen := make(map[string]struct{}, len(parts)+len(extras))
+	for _, p := range parts {
+		seen[p] = struct{}{}
+	}
+	additions := make([]string, 0, len(extras))
+	for _, extra := range extras {
+		if _, ok := seen[extra]; ok {
+			continue
+		}
+		if info, statErr := os.Stat(extra); statErr == nil && info.IsDir() {
+			additions = append(additions, extra)
+			seen[extra] = struct{}{}
+		}
+	}
+	augmented := append(additions, parts...)
+	newPath := strings.Join(augmented, string(os.PathListSeparator))
+	if newPath != current {
+		_ = os.Setenv("PATH", newPath)
+		logger.Printf("PATCH-007: augmented daemon PATH with user/local bin dirs (was=%q, now=%q)", current, newPath)
+	}
+}
+
+var cleanupLegacySocketsForDaemon = func(townRoot string) (int, int) {
+	defaultCleaned := session.CleanupLegacyDefaultSocket()
+	baseCleaned := session.CleanupLegacyBaseSocket(townRoot)
+	return defaultCleaned, baseCleaned
+}
+
 // New creates a new daemon instance.
 func New(config *Config) (*Daemon, error) {
 	// Ensure daemon directory exists
@@ -164,6 +233,12 @@ func New(config *Config) (*Daemon, error) {
 
 	logger := log.New(logWriter, "", log.LstdFlags)
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// PATCH-007 (hq-olcb): Augment PATH with common user/local bin
+	// directories before any subprocess lookup. The daemon is often launched
+	// from systemd / login shells / launchd without user-installed tool dirs
+	// such as ~/.local/bin or /opt/homebrew/bin.
+	augmentDaemonPath(logger)
 
 	// Initialize session prefix and agent registries from town root.
 	if err := session.InitRegistry(config.TownRoot); err != nil {
@@ -310,7 +385,7 @@ func New(config *Config) (*Daemon, error) {
 		}
 	}
 
-	return &Daemon{
+	d := &Daemon{
 		config:          config,
 		patrolConfig:    patrolConfig,
 		disabledPatrols: disabledPatrols,
@@ -325,7 +400,20 @@ func New(config *Config) (*Daemon, error) {
 		otelProvider:    otelProvider,
 		metrics:         dm,
 		rigPool:         newRigWorkerPool(0, 0, logger), // defaults: 10 workers, 30s timeout
-	}, nil
+	}
+	return d, nil
+}
+
+func (d *Daemon) cleanupLegacySocketSessions() {
+	d.legacySocketCleanupOnce.Do(func() {
+		defaultCleaned, baseCleaned := cleanupLegacySocketsForDaemon(d.config.TownRoot)
+		if defaultCleaned > 0 {
+			d.logger.Printf("legacy_socket_cleanup: cleaned %d session(s) from default socket", defaultCleaned)
+		}
+		if baseCleaned > 0 {
+			d.logger.Printf("legacy_socket_cleanup: cleaned %d session(s) from basename socket", baseCleaned)
+		}
+	})
 }
 
 // Run starts the daemon main loop.
@@ -416,6 +504,11 @@ func (d *Daemon) Run() (err error) {
 	if err != nil {
 		return err
 	}
+
+	// Clean sessions left behind on legacy tmux sockets after daemon startup has
+	// passed fatal preflight checks but before any patrol agents can be spawned.
+	d.cleanupLegacySocketSessions()
+
 	isRigParked := func(rigName string) bool {
 		ok, _ := d.isRigOperational(rigName)
 		return !ok
@@ -751,6 +844,12 @@ func (d *Daemon) heartbeat(state *State) {
 
 	d.metrics.recordHeartbeat(d.ctx)
 	d.logger.Println("Heartbeat starting (recovery-focused)")
+
+	// Invalidate the per-tick rigs cache so this heartbeat re-reads from disk.
+	// Within a tick the cache coalesces the ~10 getKnownRigs() call sites into
+	// a single read; invalidating here ensures we pick up rigs.json changes
+	// between ticks.
+	d.invalidateKnownRigsCache()
 
 	// 0a. Reload prefix registry so new/changed rigs get correct session names.
 	// Without this, rigs added after daemon startup get the "gt" default prefix,
@@ -1217,6 +1316,17 @@ func (d *Daemon) ensureBootRunning() {
 
 	b := boot.New(d.config.TownRoot)
 
+	// Idle suppression: if Boot's last run found deacon healthy ("nothing"),
+	// suppress spawning for longer to avoid burning API calls. (fixes gt-qu883c)
+	idleSuppression := d.loadOperationalConfig().GetDaemonConfig().BootIdleSuppressionD()
+	if status, err := b.LoadStatus(); err == nil && status.LastAction == "nothing" {
+		if !status.CompletedAt.IsZero() && time.Since(status.CompletedAt) < idleSuppression {
+			d.logger.Printf("Boot last reported 'nothing' %s ago, within idle suppression (%s), skipping",
+				time.Since(status.CompletedAt).Round(time.Second), idleSuppression)
+			return
+		}
+	}
+
 	// Check for degraded mode
 	degraded := os.Getenv("GT_DEGRADED") == "true"
 	if degraded || !d.tmux.IsAvailable() {
@@ -1499,7 +1609,6 @@ func (d *Daemon) checkDeaconHeartbeat() {
 	}
 }
 
-
 // restartStuckDeacon kills a stuck Deacon session and respawns it.
 // Uses RestartTracker for exponential backoff and crash-loop prevention.
 // Notifies via gt-notify (zero token cost) if the notify script exists.
@@ -1516,6 +1625,25 @@ func (d *Daemon) restartStuckDeacon(sessionName, reason string) {
 		if !d.restartTracker.CanRestart(agentID) {
 			remaining := d.restartTracker.GetBackoffRemaining(agentID)
 			d.logger.Printf("Stuck-agent-dog: Deacon restart in backoff, %s remaining", remaining.Round(time.Second))
+			return
+		}
+	}
+
+	// Distinguish a usage-limit pause from a true crash. If Claude is sitting
+	// at a rate-limit prompt the heartbeat will go stale, looking identical
+	// to a crash — but killing and respawning won't help (the new session
+	// hits the same limit) and the repeated kills burn the crash-loop budget.
+	// Detect the rate-limit signature in the pane and let quota_dog handle
+	// account rotation instead.
+	if d.tmux != nil {
+		if pane, err := d.tmux.CapturePane(sessionName, 30); err == nil && IsClaudeUsageLimit(pane) {
+			d.logger.Printf("Stuck-agent-dog: Deacon paused — Claude usage-limit detected, skipping kill (quota_dog will rotate accounts). Reason: %s", reason)
+			if d.restartTracker != nil {
+				d.restartTracker.RecordPause(agentID)
+				if err := d.restartTracker.Save(); err != nil {
+					d.logger.Printf("Warning: failed to save restart state: %v", err)
+				}
+			}
 			return
 		}
 	}
@@ -1938,7 +2066,28 @@ func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
 }
 
 // getKnownRigs returns list of registered rig names.
+// Results are memoized per heartbeat tick to coalesce the ~10 per-tick callers
+// into a single mayor/rigs.json read. The cache is invalidated at the start of
+// each heartbeat.
 func (d *Daemon) getKnownRigs() []string {
+	if d.knownRigsCacheValid {
+		return d.knownRigsCache
+	}
+	rigs := d.readKnownRigsFromDisk()
+	d.knownRigsCache = rigs
+	d.knownRigsCacheValid = true
+	return rigs
+}
+
+// invalidateKnownRigsCache clears the per-tick cache so the next
+// getKnownRigs() call re-reads mayor/rigs.json from disk.
+func (d *Daemon) invalidateKnownRigsCache() {
+	d.knownRigsCache = nil
+	d.knownRigsCacheValid = false
+}
+
+// readKnownRigsFromDisk reads and parses mayor/rigs.json.
+func (d *Daemon) readKnownRigsFromDisk() []string {
 	rigsPath := filepath.Join(d.config.TownRoot, "mayor", "rigs.json")
 	data, err := os.ReadFile(rigsPath)
 	if err != nil {
@@ -2604,7 +2753,7 @@ func (d *Daemon) isBeadClosed(beadID string) bool {
 	cmd := exec.Command(d.bdPath, "show", beadID, "--json") //nolint:gosec // G204: args are constructed internally
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = os.Environ()
+	cmd.Env = bdReadOnlyRoutingEnv(d.config.TownRoot)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -2628,10 +2777,17 @@ func (d *Daemon) isBeadClosed(beadID string) bool {
 // field (updateAgentHookBead is a no-op). Without this fallback, the idle reaper
 // kills working polecats whose agent bead hook_bead is stale.
 func (d *Daemon) hasAssignedOpenWork(rigName, assignee string) bool {
+	rigDir := beads.GetRigDirForName(d.config.TownRoot, rigName)
+
 	for _, status := range []string{"hooked", "in_progress", "open"} {
-		cmd := exec.Command(d.bdPath, "list", "--rig="+rigName, "--assignee="+assignee, "--status="+status, "--json") //nolint:gosec // G204: args are constructed internally
+		args := beads.InjectFlatForListJSON([]string{"list", "--assignee=" + assignee, "--status=" + status, "--json"})
+		cmd := exec.Command(d.bdPath, args...) //nolint:gosec // G204: args are constructed internally
 		cmd.Dir = d.config.TownRoot
-		cmd.Env = os.Environ()
+		if rigDir != "" {
+			cmd.Env = bdReadOnlyPinnedEnv(beads.ResolveBeadsDir(rigDir))
+		} else {
+			cmd.Env = bdReadOnlyRoutingEnv(d.config.TownRoot)
+		}
 		output, err := cmd.Output()
 		if err != nil {
 			continue
@@ -2659,7 +2815,7 @@ Restart deferred to stuck-agent-dog plugin for context-aware recovery.`,
 	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")// Identify as daemon, not overseer
+	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon") // Identify as daemon, not overseer
 	if err := cmd.Run(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of crashed polecat: %v", err)
 	}
@@ -2736,11 +2892,19 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 		agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
 		info, err := d.getAgentBeadInfo(agentBeadID)
 		if err != nil {
-			// Agent bead lookup failed — polecat has no provable work.
-			// If heartbeat is stale enough (2x timeout), reap anyway to prevent
-			// indefinite API burn when bead infrastructure is degraded.
-			// But first check if the agent is actually running (GH#3342).
-			if staleDuration >= timeout*2 && !d.tmux.IsAgentRunning(sessionName) {
+			// Agent bead lookup failed — use the authoritative work bead assignee
+			// to determine whether the polecat has real work before reaping.
+			// Bead infrastructure failures (Dolt issues, version mismatches) cause
+			// spurious lookup errors while the polecat is actively working (GH#3342).
+			assignee := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
+			if d.hasAssignedOpenWork(rigName, assignee) {
+				return
+			}
+			// No assigned work and agent not running — safe to reap.
+			// Use 3x threshold (not 2x) to avoid killing polecats during transient
+			// infrastructure degradation when the agent process is alive but not
+			// detectable (e.g. long thinking sessions, slow process inspection).
+			if staleDuration >= timeout*3 || !d.tmux.IsAgentAlive(sessionName) && staleDuration >= timeout*2 {
 				d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-bead-lookup-failed")
 			}
 			return
@@ -2768,7 +2932,7 @@ func (d *Daemon) reapIdlePolecat(rigName, polecatName string, timeout time.Durat
 		// No hooked work + stale heartbeat — but check if the agent process
 		// is still actively running before reaping. A failed gt sling rollback
 		// can clear the hook while the agent is still working (GH#3342).
-		if d.tmux.IsAgentRunning(sessionName) {
+		if d.tmux.IsAgentAlive(sessionName) {
 			return
 		}
 		d.killIdlePolecat(rigName, polecatName, sessionName, staleDuration, timeout, "working-no-hook")
@@ -2874,7 +3038,7 @@ func (d *Daemon) dispatchQueuedWork() {
 	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
 	setSysProcAttr(cmd)
 	cmd.Dir = d.config.TownRoot
-	cmd.Env = append(os.Environ(), "GT_DAEMON=1", "BD_DOLT_AUTO_COMMIT=off")
+	cmd.Env = append(beads.BuildMutationRoutingBDEnv(os.Environ(), filepath.Join(d.config.TownRoot, ".beads")), "GT_DAEMON=1")
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
 		d.logger.Printf("Scheduler dispatch timed out after 5m")

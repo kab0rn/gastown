@@ -194,6 +194,7 @@ func TestAddressToSessionIDs(t *testing.T) {
 
 		// Explicit crew/polecat - single session
 		{"gastown/crew/max", []string{"gt-crew-max"}},
+		{"gastown/polecat/nux", []string{"gt-nux"}},
 		{"gastown/polecats/nux", []string{"gt-nux"}},
 
 		// Invalid addresses - empty result
@@ -1723,6 +1724,87 @@ func TestNotifyRecipient_BusyAgent(t *testing.T) {
 	}
 }
 
+func TestNotifyRecipient_CanonicalAliasFansOutToBusyCandidates(t *testing.T) {
+	socket := requireNotifyTestSocket(t)
+	crewSession := "gt-crew-aliasfanout"
+	polecatSession := "gt-aliasfanout"
+	createNotifyTestSession(t, socket, crewSession, "sleep 300")
+	createNotifyTestSession(t, socket, polecatSession, "sleep 300")
+
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:           t.TempDir(),
+		townRoot:          townRoot,
+		tmux:              tmux.NewTmuxWithSocket(socket),
+		IdleNotifyTimeout: 10 * time.Millisecond,
+	}
+
+	msg := &Message{
+		From:     "gastown/witness",
+		To:       "gastown/aliasfanout",
+		Subject:  "fanout delivery",
+		ThreadID: "thread-fanout",
+	}
+
+	if err := r.notifyRecipient(msg); err != nil {
+		t.Fatalf("notifyRecipient returned error: %v", err)
+	}
+
+	for _, sessionID := range []string{crewSession, polecatSession} {
+		pending, err := nudge.Pending(townRoot, sessionID)
+		if err != nil {
+			t.Fatalf("Pending(%s): %v", sessionID, err)
+		}
+		if pending != 2 {
+			t.Fatalf("Pending(%s) = %d, want 2 queued nudges (mail + reminder)", sessionID, pending)
+		}
+
+		nudges, err := nudge.Drain(townRoot, sessionID)
+		if err != nil {
+			t.Fatalf("Drain(%s): %v", sessionID, err)
+		}
+		if len(nudges) != 1 {
+			t.Fatalf("Drain(%s) returned %d immediately deliverable nudges, want 1", sessionID, len(nudges))
+		}
+		if nudges[0].Kind != "mail" {
+			t.Fatalf("Drain(%s)[0].Kind = %q, want mail", sessionID, nudges[0].Kind)
+		}
+	}
+}
+
+func TestNotifyRecipient_CanonicalAliasQueuesAllHeadlessCandidates(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{
+		workDir:  t.TempDir(),
+		townRoot: townRoot,
+		tmux:     tmux.NewTmuxWithSocket("gt-test-missing-socket"),
+	}
+
+	msg := &Message{
+		From:     "mayor/",
+		To:       "gastown/headless",
+		Subject:  "headless fanout",
+		ThreadID: "thread-headless",
+	}
+
+	if err := r.notifyRecipient(msg); err != nil {
+		t.Fatalf("notifyRecipient returned error: %v", err)
+	}
+
+	for _, sessionID := range []string{"gt-crew-headless", "gt-headless"} {
+		nudges, err := nudge.Drain(townRoot, sessionID)
+		if err != nil {
+			t.Fatalf("Drain(%s): %v", sessionID, err)
+		}
+		if len(nudges) != 1 {
+			t.Fatalf("Drain(%s) returned %d nudges, want 1", sessionID, len(nudges))
+		}
+		if nudges[0].ThreadID != msg.ThreadID {
+			t.Fatalf("Drain(%s)[0].ThreadID = %q, want %q", sessionID, nudges[0].ThreadID, msg.ThreadID)
+		}
+	}
+}
+
 func TestNotifyRecipient_BusyAgentEscalationUsesUrgentQueuedNudge(t *testing.T) {
 	socket := requireNotifyTestSocket(t)
 	sessionName := "gt-crew-busy-escalation"
@@ -1877,6 +1959,47 @@ func TestEnqueueReplyReminder_Basic(t *testing.T) {
 	}
 	if !strings.Contains(q.Message, "gt mail send") {
 		t.Errorf("reminder message should mention 'gt mail send', got %q", q.Message)
+	}
+	if q.Kind != "reply-reminder" {
+		t.Errorf("Kind = %q, want %q", q.Kind, "reply-reminder")
+	}
+	if q.ThreadID != msg.ThreadID {
+		t.Errorf("ThreadID = %q, want %q", q.ThreadID, msg.ThreadID)
+	}
+}
+
+func TestClearReplyReminders(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	sessionID := session.CrewSessionName(session.PrefixFor("gastown"), "bob")
+
+	for _, n := range []nudge.QueuedNudge{
+		{Sender: "system", Message: "reply-1", Kind: "reply-reminder", ThreadID: "thread-1"},
+		{Sender: "system", Message: "reply-2", Kind: "reply-reminder", ThreadID: "thread-1"},
+		{Sender: "system", Message: "keep-mail", Kind: "mail", ThreadID: "thread-1"},
+		{Sender: "system", Message: "keep-other-thread", Kind: "reply-reminder", ThreadID: "thread-2"},
+	} {
+		if err := nudge.Enqueue(townRoot, sessionID, n); err != nil {
+			t.Fatalf("Enqueue(%q): %v", n.Message, err)
+		}
+	}
+
+	if err := r.ClearReplyReminders("gastown/crew/bob", "thread-1"); err != nil {
+		t.Fatalf("ClearReplyReminders: %v", err)
+	}
+
+	nudges, err := nudge.Drain(townRoot, sessionID)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if len(nudges) != 2 {
+		t.Fatalf("Drain returned %d nudges, want 2", len(nudges))
+	}
+	if nudges[0].Message != "keep-mail" {
+		t.Fatalf("nudges[0].Message = %q, want %q", nudges[0].Message, "keep-mail")
+	}
+	if nudges[1].Message != "keep-other-thread" {
+		t.Fatalf("nudges[1].Message = %q, want %q", nudges[1].Message, "keep-other-thread")
 	}
 }
 

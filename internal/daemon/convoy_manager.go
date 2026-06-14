@@ -383,6 +383,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		m.logger("Convoy: close detected: %s (from %s)", issueID, name)
 		resolver := convoy.NewStoreResolver(m.townRoot, stores)
 		convoy.CheckConvoysForIssue(m.ctx, hqStore, m.townRoot, issueID, "Convoy", m.logger, m.gtPath, m.isRigParked, resolver)
+		convoy.FireCrossRigDepNotifications(m.ctx, issueID, m.townRoot, stores, m.logger)
 	}
 	return nil
 }
@@ -509,6 +510,7 @@ func (m *ConvoyManager) scan() {
 func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
 	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "stranded", "--json")
 	cmd.Dir = m.townRoot
+	cmd.Env = bdReadOnlyRoutingEnv(m.townRoot)
 	util.SetProcessGroup(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -564,6 +566,7 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 		}
 		cmd := exec.CommandContext(m.ctx, m.gtPath, slingArgs...)
 		cmd.Dir = m.townRoot
+		cmd.Env = bdMutationRoutingEnv(m.townRoot)
 		util.SetProcessGroup(cmd)
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
@@ -584,6 +587,7 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 func (m *ConvoyManager) checkConvoyCompletion(convoyID string) {
 	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "check", convoyID)
 	cmd.Dir = m.townRoot
+	cmd.Env = bdMutationRoutingEnv(m.townRoot)
 	util.SetProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -599,6 +603,7 @@ func (m *ConvoyManager) closeEmptyConvoy(convoyID string) {
 
 	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "check", convoyID)
 	cmd.Dir = m.townRoot
+	cmd.Env = bdMutationRoutingEnv(m.townRoot)
 	util.SetProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

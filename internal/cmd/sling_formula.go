@@ -53,25 +53,56 @@ func trimJSONForError(jsonOutput []byte) string {
 
 // verifyFormulaExists checks that the formula exists using bd formula show.
 // Formulas are TOML files (.formula.toml).
-// Uses --allow-stale for consistency with verifyBeadExists.
+// Requests stale-read compatibility for consistency with verifyBeadExists.
 func verifyFormulaExists(formulaName string) error {
 	// Try bd formula show (handles all formula file formats)
 	// Use Output() instead of Run() to detect bd exit 0 bug:
 	// when formula not found, bd may exit 0 but produce empty stdout.
 	// Stderr discarded — first attempt may fail expectedly (retry with mol- prefix).
-	if out, err := BdCmd("formula", "show", formulaName, "--allow-stale").
+	if out, err := BdCmd("formula", "show", formulaName).
+		AllowStale().
 		Stderr(io.Discard).Output(); err == nil && len(out) > 0 {
 		return nil
 	}
 
 	// Try with mol- prefix
-	if out, err := BdCmd("formula", "show", "mol-"+formulaName, "--allow-stale").
+	if out, err := BdCmd("formula", "show", "mol-"+formulaName).
+		AllowStale().
 		Stderr(io.Discard).Output(); err == nil && len(out) > 0 {
 		return nil
 	}
 
 	return fmt.Errorf("formula '%s' not found (check 'bd formula list')", formulaName)
 }
+
+// findHookedFormulaSingleton returns the existing hooked bead for an assignee
+// when that bead already carries the same attached_formula metadata.
+func findHookedFormulaSingleton(workDir, targetAgent, formulaName string) (*beads.Issue, error) {
+	if workDir == "" || targetAgent == "" || formulaName == "" {
+		return nil, nil
+	}
+
+	b := beads.New(workDir)
+	hookedBeads, err := b.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Assignee: targetAgent,
+		Priority: -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, bead := range hookedBeads {
+		fields := beads.ParseAttachmentFields(bead)
+		if fields != nil && fields.AttachedFormula == formulaName {
+			return bead, nil
+		}
+	}
+
+	return nil, nil
+}
+
+var findHookedFormulaSingletonFn = findHookedFormulaSingleton
 
 // runSlingFormula handles standalone formula slinging.
 // Flow: cook → wisp → attach to hook → nudge
@@ -90,15 +121,30 @@ func runSlingFormula(ctx context.Context, args []string) error {
 	if len(args) > 1 {
 		target = args[1]
 	}
+	var admission *polecatAdmissionHandle
+	if !slingDryRun && target != "" {
+		admissionRig := ""
+		if rigName, isRig := IsRigName(target); isRig {
+			admissionRig = rigName
+		}
+		if admissionRig != "" {
+			admission, _, err = acquirePolecatAdmissionFn(townRoot, admissionRig, formulaName, "formula")
+			if err != nil {
+				return err
+			}
+			defer admission.Release()
+		}
+	}
 	resolved, err := resolveTarget(target, ResolveTargetOptions{
-		DryRun:   slingDryRun,
-		Force:    slingForce,
-		Create:   slingCreate,
-		Account:  slingAccount,
-		Agent:    slingAgent,
-		NoBoot:   slingNoBoot,
-		WorkDesc: formulaName,
-		TownRoot: townRoot,
+		DryRun:               slingDryRun,
+		Force:                slingForce,
+		Create:               slingCreate,
+		Account:              slingAccount,
+		Agent:                slingAgent,
+		NoBoot:               slingNoBoot,
+		WorkDesc:             formulaName,
+		TownRoot:             townRoot,
+		SkipPolecatAdmission: admission != nil,
 	})
 	if err != nil {
 		return err
@@ -119,7 +165,22 @@ func runSlingFormula(ctx context.Context, args []string) error {
 		rollbackSlingArtifactsFn(resolved.NewPolecatInfo, beadID, formulaWorkDir, "")
 	}
 
+	// Resolve working directory for bd commands (routes to correct rig beads)
+	// Fall back to townRoot (HQ beads) if no specific rig directory was determined
+	if formulaWorkDir == "" {
+		formulaWorkDir = townRoot
+	}
+
 	if slingDryRun {
+		existing, err := findHookedFormulaSingletonFn(formulaWorkDir, targetAgent, formulaName)
+		if err != nil {
+			return fmt.Errorf("checking existing hooked formulas for %s: %w", targetAgent, err)
+		}
+		if existing != nil && !slingForce {
+			fmt.Printf("Would reuse existing formula %s on %s via %s\n", formulaName, targetAgent, existing.ID)
+			return nil
+		}
+
 		fmt.Printf("Would cook formula: %s\n", formulaName)
 		fmt.Printf("Would create wisp and pin to: %s\n", targetAgent)
 		for _, v := range slingVars {
@@ -129,10 +190,32 @@ func runSlingFormula(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	// Resolve working directory for bd commands (routes to correct rig beads)
-	// Fall back to townRoot (HQ beads) if no specific rig directory was determined
-	if formulaWorkDir == "" {
-		formulaWorkDir = townRoot
+	// Serialize standalone formula slings per assignee so same-formula retries
+	// and handoffs cannot create duplicate hooked wisps for one target.
+	assigneeUnlock, assigneeLockErr := tryAcquireSlingAssigneeLock(townRoot, targetAgent)
+	if assigneeLockErr != nil {
+		return fmt.Errorf("serializing formula sling for %s: %w", targetAgent, assigneeLockErr)
+	}
+	defer assigneeUnlock()
+
+	existing, err := findHookedFormulaSingletonFn(formulaWorkDir, targetAgent, formulaName)
+	if err != nil {
+		return fmt.Errorf("checking existing hooked formulas for %s: %w", targetAgent, err)
+	}
+	if existing != nil && !slingForce {
+		fmt.Printf("%s Formula %s already hooked to %s via %s, no-op\n",
+			style.Dim.Render("○"), formulaName, targetAgent, existing.ID)
+		return nil
+	}
+	if admission == nil && strings.Contains(targetAgent, "/polecats/") {
+		parts := strings.Split(targetAgent, "/")
+		if len(parts) >= 3 {
+			admission, _, err = acquirePolecatAdmissionFn(townRoot, parts[0], formulaName, "formula")
+			if err != nil {
+				return err
+			}
+			defer admission.Release()
+		}
 	}
 
 	// Step 1: Cook the formula (ensures proto exists)
@@ -177,15 +260,9 @@ func runSlingFormula(ctx context.Context, args []string) error {
 	fmt.Printf("%s Wisp created: %s\n", style.Bold.Render("✓"), wispRootID)
 
 	// Step 3: Hook the wisp bead with retry and verification.
-	// See: https://github.com/steveyegge/gastown/issues/148
-	// Acquire per-assignee lock to serialize concurrent hook writes (issue #3114).
-	assigneeUnlock, assigneeLockErr := tryAcquireSlingAssigneeLock(townRoot, targetAgent)
-	if assigneeLockErr != nil {
-		return fmt.Errorf("serializing hook write for %s: %w", targetAgent, assigneeLockErr)
-	}
-	defer assigneeUnlock()
+	// See: https://github.com/steveyegge/gastown/issues/148.
 	hookDir := beads.ResolveHookDir(townRoot, wispRootID, "")
-	if err := hookBeadWithRetry(wispRootID, targetAgent, hookDir); err != nil {
+	if err := hookBeadWithRetryFn(wispRootID, targetAgent, hookDir); err != nil {
 		return err
 	}
 	fmt.Printf("%s Attached to hook (status=hooked)\n", style.Bold.Render("✓"))

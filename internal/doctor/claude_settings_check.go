@@ -521,15 +521,43 @@ func (c *ClaudeSettingsCheck) findSettingsFiles(townRoot string) []staleSettings
 				}
 			}
 		}
+
+		// Check for STALE rig-root settings (<rig>/.claude/settings.json).
+		// Legacy pattern predating the per-role architecture. Superseded by
+		// per-role files (witness/.claude/, polecats/.claude/, etc.).
+		// Skip if tracked in a customer repo — could be intentional.
+		for _, staleFile := range []string{"settings.json", "settings.local.json"} {
+			rigRootSettings := filepath.Join(rigPath, ".claude", staleFile)
+			if fileExists(rigRootSettings) {
+				gs := c.getGitFileStatus(rigRootSettings)
+				if gs != gitStatusTrackedClean && gs != gitStatusTrackedModified {
+					files = append(files, staleSettingsInfo{
+						path:          rigRootSettings,
+						agentType:     "rig-root",
+						rigName:       rigName,
+						wrongLocation: true,
+						gitStatus:     gs,
+						missing:       []string{"legacy rig-root settings (superseded by per-role files)"},
+					})
+				}
+			}
+		}
 	}
 
 	return files
 }
 
 // checkSettings compares a settings file against the expected template.
-// Returns a list of what's missing.
-// agentType is reserved for future role-specific validation.
-func (c *ClaudeSettingsCheck) checkSettings(path, _ string) []string {
+// Returns a list of what's missing. Stop-hook expectations are role-specific
+// to match the canonical hook templates in internal/hooks/config.go (#3648):
+//
+//   - polecat → `gt tap polecat-stop-check` (idle-polecat catcher)
+//   - everyone else → `gt costs record` (autonomous cost accounting)
+//
+// Without this, doctor never converged for polecats: hooks sync wrote
+// polecat-stop-check, doctor demanded costs record, fix deleted the file,
+// the daemon recreated the same polecat-stop-check file, repeat forever.
+func (c *ClaudeSettingsCheck) checkSettings(path, agentType string) []string {
 	var missing []string
 
 	// Read the actual settings
@@ -547,7 +575,7 @@ func (c *ClaudeSettingsCheck) checkSettings(path, _ string) []string {
 	// All templates should have:
 	// 1. enabledPlugins
 	// 2. SessionStart hook with prime --hook
-	// 3. Stop hook with gt costs record (for autonomous)
+	// 3. Stop hook (role-specific pattern — see expectedStopPattern)
 	// Check enabledPlugins
 	if _, ok := actual["enabledPlugins"]; !ok {
 		missing = append(missing, "enabledPlugins")
@@ -564,12 +592,25 @@ func (c *ClaudeSettingsCheck) checkSettings(path, _ string) []string {
 		missing = append(missing, "SessionStart hook (prime --hook)")
 	}
 
-	// Check Stop hook exists with costs record (for all roles)
-	if !c.hookHasPattern(hooks, "Stop", "costs record") {
-		missing = append(missing, "Stop hook")
+	// Check Stop hook against the expected pattern for this role.
+	expected := expectedStopPattern(agentType)
+	if !c.hookHasPattern(hooks, "Stop", expected) {
+		missing = append(missing, fmt.Sprintf("Stop hook (%s)", expected))
 	}
 
 	return missing
+}
+
+// expectedStopPattern returns the substring that should appear in the role's
+// Stop hook command. Mirrors the templates in internal/hooks/config.go's
+// DefaultOverrides — when those change, this must change too.
+func expectedStopPattern(agentType string) string {
+	switch agentType {
+	case "polecat", "polecats":
+		return "polecat-stop-check"
+	default:
+		return "costs record"
+	}
 }
 
 // getGitFileStatus determines the git status of a file.
@@ -694,6 +735,13 @@ func (c *ClaudeSettingsCheck) Fix(ctx *CheckContext) error {
 		// settings before the fix does (gt-99u).
 		if sf.wrongLocation {
 			_ = os.Remove(claudeDir) // Best-effort, will fail if not empty
+		}
+
+		// Rig-root settings: just delete. Per-role files are authoritative.
+		// There is no correct "rig-root" settings location to recreate at.
+		if sf.agentType == "rig-root" {
+			fmt.Printf("\n  %s Rig-root settings removed. Per-role settings in %s/{witness,polecats,...}/.claude/ are authoritative.\n", style.Warning.Render("⚠"), sf.rigName)
+			continue
 		}
 
 		// Handle town-root files: redirect to mayor/ instead of recreating at root.

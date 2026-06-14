@@ -179,10 +179,8 @@ exit 0
 	}
 	logContent := string(logBytes)
 
-	// The first line starting with CMD: is the create command (NUL-delimited args).
-	// Check for --labels=gt:owned anywhere in the logged content for the create call.
-	if !strings.Contains(logContent, "--labels=gt:owned") {
-		t.Errorf("create command missing --labels=gt:owned in log:\n%q", logContent)
+	if !strings.Contains(logContent, "--labels=gt:convoy,gt:owned") {
+		t.Errorf("create command missing convoy/owned labels in log:\n%q", logContent)
 	}
 }
 
@@ -467,9 +465,9 @@ shift || true
 
 case "$cmd" in
   sql)
-    # bdDepListRawIDs up: SELECT issue_id FROM dependencies WHERE depends_on_id = '<beadID>' AND type = 'tracks'
+    # bdDepListRawIDs up: match beadID against typed dependency target columns.
     case "$*" in
-      *"depends_on_id = 'gt-bbb'"*)
+      *"depends_on_issue_id = 'gt-bbb'"*)
         echo '[{"issue_id":"hq-cv-existing"}]'
         ;;
       *)
@@ -959,8 +957,8 @@ exit 0
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
-	if !strings.Contains(string(logBytes), "--labels=gt:owned") {
-		t.Errorf("create should include --labels=gt:owned:\n%q", string(logBytes))
+	if !strings.Contains(string(logBytes), "--labels=gt:convoy,gt:owned") {
+		t.Errorf("create should include convoy/owned labels:\n%q", string(logBytes))
 	}
 }
 

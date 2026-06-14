@@ -160,6 +160,13 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 1. Resolve runtime config.
 	runtimeConfig := config.ResolveRoleAgentConfig(cfg.Role, cfg.TownRoot, cfg.RigPath)
+	if cfg.AgentOverride != "" {
+		rc, _, err := config.ResolveAgentConfigWithOverride(cfg.TownRoot, cfg.RigPath, cfg.AgentOverride)
+		if err != nil {
+			return nil, fmt.Errorf("resolving agent config for %s: %w", cfg.AgentOverride, err)
+		}
+		runtimeConfig = rc
+	}
 
 	// 2. Ensure settings/plugins exist for the agent.
 	settingsDir := config.RoleSettingsDir(cfg.Role, cfg.RigPath)
@@ -188,26 +195,11 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		})
 	}
 
-	// Prepend GT_RUN (GASTA run ID) and any extra env vars into the command so
-	// that they are inherited by the initial shell before tmux SetEnvironment runs.
-	extraWithRun := make(map[string]string, len(cfg.ExtraEnv)+1)
-	for k, v := range cfg.ExtraEnv {
-		extraWithRun[k] = v
-	}
-	extraWithRun["GT_RUN"] = runID
-	command = config.PrependEnv(command, extraWithRun)
-
-	// 4. Create tmux session with command.
-	if err := t.NewSessionWithCommand(cfg.SessionID, cfg.WorkDir, command); err != nil {
-		return nil, fmt.Errorf("creating session: %w", err)
-	}
-
-	// 5. Set remain-on-exit immediately if requested (before anything else can fail).
-	if cfg.RemainOnExit {
-		_ = t.SetRemainOnExit(cfg.SessionID, true)
-	}
-
-	// 6. Set environment variables.
+	// 4. Compute environment variables BEFORE creating the session so they
+	// can be passed via tmux -e flags. Setting env via SetEnvironment after
+	// session creation only affects newly spawned panes — the running pane
+	// (and any subprocess the agent spawns, e.g. bd) keeps its original
+	// environment (gt-neycp).
 	envVars := config.AgentEnv(config.AgentEnvConfig{
 		Role:             cfg.Role,
 		Rig:              cfg.RigName,
@@ -218,13 +210,20 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		SessionName:      cfg.SessionID,
 	})
 	envVars = MergeRuntimeLivenessEnv(envVars, runtimeConfig)
-	for _, k := range mapKeysSorted(envVars) {
-		_ = t.SetEnvironment(cfg.SessionID, k, envVars[k])
+	envVars["GT_RUN"] = runID
+	for k, v := range cfg.ExtraEnv {
+		envVars[k] = v
 	}
-	// Set GT_RUN in the session environment so respawned processes also inherit it.
-	_ = t.SetEnvironment(cfg.SessionID, "GT_RUN", runID)
-	for _, k := range mapKeysSorted(cfg.ExtraEnv) {
-		_ = t.SetEnvironment(cfg.SessionID, k, cfg.ExtraEnv[k])
+
+	// 5. Create tmux session with command and env vars via -e flags so the
+	// initial shell — and the agent's subprocesses — inherit them from the start.
+	if err := t.NewSessionWithCommandAndEnv(cfg.SessionID, cfg.WorkDir, command, envVars); err != nil {
+		return nil, fmt.Errorf("creating session: %w", err)
+	}
+
+	// 6. Set remain-on-exit immediately if requested (before anything else can fail).
+	if cfg.RemainOnExit {
+		_ = t.SetRemainOnExit(cfg.SessionID, true)
 	}
 
 	// 7. Apply theme.
@@ -252,6 +251,10 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	// 10. Accept startup dialogs (workspace trust + bypass permissions).
 	if cfg.AcceptBypass {
 		_ = t.AcceptStartupDialogs(cfg.SessionID)
+		if err := t.CheckStartupBlocked(cfg.SessionID); err != nil {
+			_ = t.KillSessionWithProcesses(cfg.SessionID)
+			return nil, fmt.Errorf("startup blocked: %w", err)
+		}
 	}
 
 	// 11. Ready delay: wait for agent to be fully ready at the prompt.
@@ -273,6 +276,14 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		}
 		if !running {
 			return nil, fmt.Errorf("session %s died during startup (agent command may have failed)", cfg.SessionID)
+		}
+		if err := t.CheckStartupBlocked(cfg.SessionID); err != nil {
+			_ = t.KillSessionWithProcesses(cfg.SessionID)
+			return nil, fmt.Errorf("startup blocked: %w", err)
+		}
+		if status := t.CheckSessionHealth(cfg.SessionID, 0); status != tmux.SessionHealthy {
+			_ = t.KillSessionWithProcesses(cfg.SessionID)
+			return nil, fmt.Errorf("session %s unhealthy during startup: %s", cfg.SessionID, status)
 		}
 	}
 
@@ -399,17 +410,19 @@ func MergeRuntimeLivenessEnv(envVars map[string]string, runtimeConfig *config.Ru
 	if _, hasProcessNames := envVars["GT_PROCESS_NAMES"]; !hasProcessNames {
 		agentForLookup := runtimeConfig.ResolvedAgent
 		commandForLookup := runtimeConfig.Command
+		argsForLookup := runtimeConfig.Args
 		if existing, ok := envVars["GT_AGENT"]; ok && existing != "" {
 			agentForLookup = existing
 			// When GT_AGENT was set by AgentOverride (differs from the
-			// workspace-resolved agent), the runtimeConfig.Command belongs
-			// to the workspace agent, not the override. Pass empty command
-			// so ResolveProcessNames uses the preset's own command.
+			// workspace-resolved agent), the runtimeConfig.Command/Args
+			// belong to the workspace agent, not the override. Pass empty
+			// command so ResolveProcessNames uses the preset's own command.
 			if existing != runtimeConfig.ResolvedAgent {
 				commandForLookup = ""
+				argsForLookup = nil
 			}
 		}
-		processNames := config.ResolveProcessNames(agentForLookup, commandForLookup)
+		processNames := config.ResolveProcessNames(agentForLookup, commandForLookup, argsForLookup...)
 		if len(processNames) > 0 {
 			envVars["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 		}

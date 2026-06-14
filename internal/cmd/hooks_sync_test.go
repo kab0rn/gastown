@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -177,6 +178,72 @@ func TestSyncTargetUnchanged(t *testing.T) {
 	}
 }
 
+func TestSyncTargetUpdatesExistingPromptDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	targetPath := filepath.Join(tmpDir, "test", ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	expected, err := hooks.ComputeExpected("crew")
+	if err != nil {
+		t.Fatalf("ComputeExpected failed: %v", err)
+	}
+	rawHooks, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatalf("marshal hooks: %v", err)
+	}
+	existing := map[string]json.RawMessage{
+		"customSentinel": json.RawMessage(`true`),
+		"hooks":          rawHooks,
+	}
+	data, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	if err := os.WriteFile(targetPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	target := hooks.Target{
+		Path: targetPath,
+		Key:  "crew",
+		Role: "crew",
+	}
+
+	result, err := syncTarget(target, false)
+	if err != nil {
+		t.Fatalf("syncTarget failed: %v", err)
+	}
+	if result != syncUpdated {
+		t.Fatalf("expected syncUpdated, got %d", result)
+	}
+
+	data, err = os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("settings are not valid JSON: %v", err)
+	}
+	if got, ok := settings["customSentinel"].(bool); !ok || !got {
+		t.Fatalf("customSentinel = %v, want true", settings["customSentinel"])
+	}
+	if got, ok := settings["hasCompletedOnboarding"].(bool); !ok || !got {
+		t.Fatalf("hasCompletedOnboarding = %v, want true", settings["hasCompletedOnboarding"])
+	}
+	permissions, ok := settings["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("permissions = %T, want object", settings["permissions"])
+	}
+	if got := permissions["defaultMode"]; got != "bypassPermissions" {
+		t.Fatalf("permissions.defaultMode = %v, want bypassPermissions", got)
+	}
+}
+
 func TestSyncTargetDryRun(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
@@ -248,6 +315,54 @@ func TestSyncTargetSetsEnabledPlugins(t *testing.T) {
 	}
 	if settings.EnabledPlugins["beads@beads-marketplace"] != false {
 		t.Error("beads@beads-marketplace should be disabled")
+	}
+}
+
+func TestSyncTargetCreatesClaudePromptDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	targetPath := filepath.Join(tmpDir, "test-rig", "crew", ".claude", "settings.json")
+	target := hooks.Target{
+		Path: targetPath,
+		Key:  "crew",
+		Role: "crew",
+	}
+
+	if _, err := syncTarget(target, false); err != nil {
+		t.Fatalf("syncTarget failed: %v", err)
+	}
+
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	if strings.Contains(string(data), "export PATH=") {
+		t.Fatal("synced settings contain stale export PATH marker")
+	}
+	if strings.Contains(string(data), "{{GT_BIN}}") {
+		t.Fatal("synced settings contain unresolved {{GT_BIN}} placeholder")
+	}
+
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		t.Fatalf("settings are not valid JSON: %v", err)
+	}
+	if got, ok := settings["skipDangerousModePermissionPrompt"].(bool); !ok || !got {
+		t.Fatalf("skipDangerousModePermissionPrompt = %v, want true", settings["skipDangerousModePermissionPrompt"])
+	}
+	if got, ok := settings["hasCompletedOnboarding"].(bool); !ok || !got {
+		t.Fatalf("hasCompletedOnboarding = %v, want true", settings["hasCompletedOnboarding"])
+	}
+	if got := settings["theme"]; got != "dark" {
+		t.Fatalf("theme = %v, want dark", got)
+	}
+	permissions, ok := settings["permissions"].(map[string]any)
+	if !ok {
+		t.Fatalf("permissions = %T, want object", settings["permissions"])
+	}
+	if got := permissions["defaultMode"]; got != "bypassPermissions" {
+		t.Fatalf("permissions.defaultMode = %v, want bypassPermissions", got)
 	}
 }
 
@@ -452,5 +567,87 @@ func TestRunHooksSyncNonClaudeAgentDryRun(t *testing.T) {
 	pluginPath := filepath.Join(townRoot, "myrig", "crew", "alice", ".opencode", "plugins", "gastown.js")
 	if _, err := os.Stat(pluginPath); !os.IsNotExist(err) {
 		t.Error("dry-run should not create opencode plugin file")
+	}
+}
+
+func TestRunHooksSyncNonClaudeAgentNestedPolecatWorktree(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := filepath.Join(tmpDir, "town")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "deacon"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(townRoot, "myrig", "polecats", "fury", "gastown")
+	if err := os.MkdirAll(filepath.Join(worktree, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(townRoot, "mayor", "town.json"),
+		[]byte(`{"type":"town","version":1,"name":"test"}`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.RoleAgents = map[string]string{"polecat": "opencode"}
+	townSettings.Agents = map[string]*config.RuntimeConfig{
+		"opencode": {
+			Provider: "opencode",
+			Command:  "opencode",
+		},
+	}
+	if err := os.MkdirAll(filepath.Join(townRoot, "settings"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatal(err)
+	}
+
+	base := &hooks.HooksConfig{
+		SessionStart: []hooks.HookEntry{
+			{Matcher: "", Hooks: []hooks.Hook{{Type: "command", Command: "echo test"}}},
+		},
+	}
+	if err := hooks.SaveBase(base); err != nil {
+		t.Fatalf("SaveBase failed: %v", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(cwd) }()
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	hooksSyncDryRun = false
+	if err := runHooksSync(nil, nil); err != nil {
+		t.Fatalf("runHooksSync failed: %v", err)
+	}
+
+	pluginPath := filepath.Join(worktree, ".opencode", "plugins", "gastown.js")
+	if _, err := os.Stat(pluginPath); os.IsNotExist(err) {
+		t.Fatalf("opencode plugin not created in nested polecat worktree %s", pluginPath)
+	}
+
+	wrongParentPath := filepath.Join(townRoot, "myrig", "polecats", "fury", ".opencode", "plugins", "gastown.js")
+	if _, err := os.Stat(wrongParentPath); !os.IsNotExist(err) {
+		t.Fatalf("opencode plugin should not be created in polecat slot parent %s", wrongParentPath)
 	}
 }

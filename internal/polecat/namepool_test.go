@@ -166,9 +166,9 @@ func TestNamePool_SaveLoad(t *testing.T) {
 	pool := NewNamePoolWithConfig(tmpDir, "testrig", "mad-max", nil, 3)
 
 	// Exhaust the pool to trigger overflow, which increments OverflowNext
-	pool.Allocate() // furiosa
-	pool.Allocate() // nux
-	pool.Allocate() // slit
+	pool.Allocate()                    // furiosa
+	pool.Allocate()                    // nux
+	pool.Allocate()                    // slit
 	overflowName, _ := pool.Allocate() // 4 (overflow - just number, not rig-prefixed)
 
 	if overflowName != "4" {
@@ -194,9 +194,9 @@ func TestNamePool_SaveLoad(t *testing.T) {
 
 	// OverflowNext SHOULD persist - it's the one piece of state that can't be derived.
 	// Next overflow should be 5, not 4 (OverflowNext persisted).
-	pool2.Allocate() // furiosa (InUse empty, so starts from beginning)
-	pool2.Allocate() // nux
-	pool2.Allocate() // slit
+	pool2.Allocate()                     // furiosa (InUse empty, so starts from beginning)
+	pool2.Allocate()                     // nux
+	pool2.Allocate()                     // slit
 	overflowName2, _ := pool2.Allocate() // Should be 5
 
 	if overflowName2 != "5" {
@@ -226,6 +226,26 @@ func TestNamePool_Reconcile(t *testing.T) {
 	name, _ := pool.Allocate()
 	if name != "furiosa" {
 		t.Errorf("expected furiosa, got %s", name)
+	}
+}
+
+func TestNamePool_ReconcileAdvancesOverflowPastNumericPolecats(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "namepool-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	pool := NewNamePoolWithConfig(tmpDir, "testrig", "mad-max", nil, 3)
+
+	pool.Reconcile([]string{"furiosa", "nux", "slit", "62", "65"})
+
+	name, err := pool.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	if name != "66" {
+		t.Fatalf("expected next overflow name 66, got %s", name)
 	}
 }
 
@@ -818,9 +838,9 @@ func TestValidatePoolName(t *testing.T) {
 		{"furiosa", false},
 		{"beta-name", false},
 		{"alpha123", false},
-		{"abc", true},  // too short
-		{"ab", true},   // too short
-		{"", true},     // empty
+		{"abc", true},   // too short
+		{"ab", true},    // too short
+		{"", true},      // empty
 		{"UPPER", true}, // uppercase
 		{"has space", true},
 		{"witness", true},  // reserved
@@ -1226,5 +1246,28 @@ func TestGetNames_FallbackOnDeletedThemeFile(t *testing.T) {
 	// Should get the first name from the default theme (mad-max), which is "furiosa"
 	if name != "furiosa" {
 		t.Errorf("expected fallback to default theme (furiosa), got %s", name)
+	}
+}
+
+func TestGetNames_UnresolvableTheme_FallsBackToDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	pool := NewNamePoolWithConfig(tmpDir, "testrig", "nonexistent-theme", nil, 10)
+	pool.SetTownRoot(tmpDir)
+
+	name, err := pool.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate error: %v", err)
+	}
+	defaultNames := BuiltinThemes[DefaultTheme]
+	found := false
+	for _, dn := range defaultNames {
+		if dn == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected name from default theme, got %q", name)
 	}
 }

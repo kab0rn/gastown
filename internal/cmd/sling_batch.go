@@ -27,10 +27,15 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 			return fmt.Errorf("bead '%s' not found", beadID)
 		}
 	}
+	townRoot := filepath.Dir(townBeadsDir)
+	for _, beadID := range beadIDs {
+		if err := verifyBeadExistsInTargetRigDatabase(beadID, rigName, townRoot); err != nil {
+			return err
+		}
+	}
 
 	// Cross-rig guard: check all beads match the target rig before spawning (gt-myecw)
 	if !slingForce {
-		townRoot := filepath.Dir(townBeadsDir)
 		for _, beadID := range beadIDs {
 			prefix := beads.ExtractPrefix(beadID)
 			beadRig := beads.GetRigNameForPrefix(townRoot, prefix)
@@ -88,11 +93,10 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 	fmt.Printf("%s Batch slinging %d beads to rig '%s'...\n", style.Bold.Render("🎯"), len(beadIDs), rigName)
 
 	if slingMaxConcurrent > 0 {
-		fmt.Printf("  Max concurrent spawns: %d\n", slingMaxConcurrent)
+		fmt.Printf("  Spawn batch size: %d (spawns N, pauses, spawns N more)\n", slingMaxConcurrent)
 	}
 
 	// Cook formula once before the loop for efficiency
-	townRoot := filepath.Dir(townBeadsDir)
 	formulaCooked := false
 
 	// Pre-cook formula before the loop (batch optimization: cook once, instantiate many)
@@ -123,9 +127,11 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 
 	// Dispatch each bead via executeSling
 	for i, beadID := range beadIDs {
-		// Admission control: throttle spawns when --max-concurrent is set
+		// Spawn-rate throttle: when --max-concurrent is set, pause between batches
+		// of N spawns. This does NOT limit total concurrent polecats — all spawned
+		// polecats remain running. It only slows down how fast they are created.
 		if slingMaxConcurrent > 0 && activeCount >= slingMaxConcurrent {
-			fmt.Printf("\n%s Max concurrent limit reached (%d), waiting for capacity...\n",
+			fmt.Printf("\n%s Spawn batch of %d complete, pausing before next batch...\n",
 				style.Warning.Render("⏳"), slingMaxConcurrent)
 			// Wait for sessions to settle before spawning more
 			for wait := 0; wait < 30; wait++ {
@@ -214,6 +220,9 @@ func runBatchSling(beadIDs []string, rigName string, townBeadsDir string) error 
 				fmt.Printf("  %s %s: %s\n", style.Dim.Render("✗"), r.beadID, r.errMsg)
 			}
 		}
+	}
+	if successCount == 0 && len(beadIDs) > 0 {
+		return fmt.Errorf("batch sling failed: 0/%d succeeded", len(beadIDs))
 	}
 
 	return nil

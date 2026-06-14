@@ -285,6 +285,167 @@ func GetRigPathForPrefix(townRoot, prefix string) string {
 	return ""
 }
 
+// GetRigDirForName returns the rig directory path for a named rig.
+// The rig directory is the parent of the rig's .beads database and is the
+// directory that contains the rig's .beads database. Returns empty string if the rig is not
+// found in routes or is town-level (path=".").
+func GetRigDirForName(townRoot, rigName string) string {
+	beadsDir := filepath.Join(townRoot, ".beads")
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil || routes == nil {
+		return ""
+	}
+	for _, r := range routes {
+		if r.Path == "." {
+			continue // town-level, not a specific rig dir
+		}
+		parts := strings.SplitN(r.Path, "/", 2)
+		if len(parts) > 0 && parts[0] == rigName {
+			return filepath.Join(townRoot, r.Path)
+		}
+	}
+	return ""
+}
+
+// ResolveRepoAliasBeadsDir resolves a Gas Town repo alias to its canonical
+// .beads directory. Bare aliases are route names like "gastown" plus the
+// town aliases "hq" and "town"; path-like repo values are intentionally left
+// unresolved so callers can preserve bd's native --repo path semantics.
+func ResolveRepoAliasBeadsDir(townRoot, repo string) (string, bool) {
+	if townRoot == "" || isRepoPathLike(repo) {
+		return "", false
+	}
+
+	if repo == "hq" || repo == "town" {
+		beadsDir := filepath.Join(townRoot, ".beads")
+		return beadsDir, validRepoAliasBeadsDir(townRoot, beadsDir)
+	}
+
+	rigDir := GetRigDirForName(townRoot, repo)
+	if rigDir == "" || !pathWithin(townRoot, rigDir) {
+		return "", false
+	}
+
+	beadsDir := ResolveBeadsDir(rigDir)
+	if !validRepoAliasBeadsDir(townRoot, beadsDir) {
+		return "", false
+	}
+	return beadsDir, true
+}
+
+// RewriteBDCreateRepoAlias removes a single bd create --repo alias from argv
+// and returns the canonical .beads target for callers to pin via BEADS_DIR.
+// Unresolved, path-like, duplicate, or positional --repo values are preserved so
+// bd keeps its native --repo behavior outside Gas Town aliases.
+func RewriteBDCreateRepoAlias(townRoot string, argv []string) ([]string, string) {
+	cmdIndex, ok := BDSubcommandIndex(argv)
+	if !ok || argv[cmdIndex] != "create" {
+		return argv, ""
+	}
+	if countBDRepoFlags(argv, cmdIndex+1) != 1 {
+		return argv, ""
+	}
+
+	rewritten := make([]string, 0, len(argv))
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--" {
+			rewritten = append(rewritten, argv[i:]...)
+			break
+		}
+
+		if arg == "--repo" {
+			if i+1 >= len(argv) {
+				rewritten = append(rewritten, arg)
+				continue
+			}
+			value := argv[i+1]
+			if beadsDir, ok := ResolveRepoAliasBeadsDir(townRoot, value); ok {
+				i++
+				return append(rewritten, argv[i+1:]...), beadsDir
+			}
+			rewritten = append(rewritten, arg, value)
+			i++
+			continue
+		}
+
+		if strings.HasPrefix(arg, "--repo=") {
+			value := strings.TrimPrefix(arg, "--repo=")
+			if beadsDir, ok := ResolveRepoAliasBeadsDir(townRoot, value); ok {
+				return append(rewritten, argv[i+1:]...), beadsDir
+			}
+		}
+
+		rewritten = append(rewritten, arg)
+	}
+
+	return rewritten, ""
+}
+
+func countBDRepoFlags(argv []string, start int) int {
+	count := 0
+	for i := start; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--" {
+			break
+		}
+		if arg == "--repo" {
+			count++
+			if i+1 < len(argv) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--repo=") {
+			count++
+		}
+	}
+	return count
+}
+
+func isRepoPathLike(value string) bool {
+	if value == "" || filepath.IsAbs(value) {
+		return true
+	}
+	if strings.HasPrefix(value, ".") || strings.HasPrefix(value, "~") {
+		return true
+	}
+	if strings.ContainsAny(value, `/\\`) || strings.Contains(value, "://") {
+		return true
+	}
+	if len(value) >= 2 && value[1] == ':' {
+		return true
+	}
+	return strings.Contains(value, "@") && strings.Contains(value, ":")
+}
+
+func validRepoAliasBeadsDir(townRoot, beadsDir string) bool {
+	if filepath.Base(filepath.Clean(beadsDir)) != ".beads" {
+		return false
+	}
+	info, err := os.Stat(beadsDir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	return pathWithin(townRoot, beadsDir)
+}
+
+func pathWithin(root, path string) bool {
+	if resolvedRoot, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolvedRoot
+	}
+	if resolvedPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolvedPath
+	}
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
+}
+
 // GetRigNameForPrefix returns the rig name that owns a given bead prefix.
 // For example, "gt-" returns "gastown", "bd-" returns "beads".
 // Returns empty string if the prefix is town-level (path=".") or not found in routes.
@@ -321,7 +482,17 @@ func ResolveBeadsDirForID(currentBeadsDir, beadID string) string {
 		return currentBeadsDir
 	}
 
-	routes, err := LoadRoutes(currentBeadsDir)
+	routesBeadsDir := currentBeadsDir
+	routes, err := LoadRoutes(routesBeadsDir)
+	if (err != nil || routes == nil) && currentBeadsDir != "" {
+		if townRoot := FindTownRoot(filepath.Dir(currentBeadsDir)); townRoot != "" {
+			townBeadsDir := filepath.Join(townRoot, ".beads")
+			if townBeadsDir != currentBeadsDir {
+				routesBeadsDir = townBeadsDir
+				routes, err = LoadRoutes(routesBeadsDir)
+			}
+		}
+	}
 	if err != nil || routes == nil {
 		return currentBeadsDir
 	}
@@ -329,11 +500,11 @@ func ResolveBeadsDirForID(currentBeadsDir, beadID string) string {
 	for _, r := range routes {
 		if r.Prefix == prefix {
 			if r.Path == "." {
-				return currentBeadsDir // Town-level — already correct
+				return routesBeadsDir
 			}
 			// Rig-level bead — resolve to rig's beads directory.
-			// Derive town root from currentBeadsDir (parent of .beads).
-			townRoot := filepath.Dir(currentBeadsDir)
+			// Derive town root from the routes directory we actually used.
+			townRoot := filepath.Dir(routesBeadsDir)
 			rigDir := filepath.Join(townRoot, r.Path)
 			return ResolveBeadsDir(rigDir)
 		}
@@ -350,7 +521,7 @@ func ResolveBeadsDirForID(currentBeadsDir, beadID string) string {
 // typically indicates the bd create routing resolved to the town-level database
 // instead of the rig's database. Callers should log the warning and continue.
 func ValidateRigPrefix(townRoot, rigName, beadID string) error {
-	expectedPrefix := GetPrefixForRig(townRoot, rigName) // e.g., "gt"
+	expectedPrefix := GetPrefixForRig(townRoot, rigName)           // e.g., "gt"
 	actualPrefix := strings.TrimSuffix(ExtractPrefix(beadID), "-") // e.g., "gt"
 	if actualPrefix == "" {
 		return nil // Can't determine prefix — not an error

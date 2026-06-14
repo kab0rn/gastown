@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/hookutil"
 )
 
@@ -68,7 +69,15 @@ func needsUpgrade(content []byte) bool {
 	// Stale pattern: export PATH=... && gt — replaced by {{GT_BIN}} in current templates.
 	// The PATH export breaks Gemini CLI's hook runner which expands $PATH into
 	// an enormous string. Also catches files missing GT_HOOK_SOURCE env vars.
-	return bytes.Contains(content, []byte(`export PATH=`))
+	if bytes.Contains(content, []byte(`export PATH=`)) {
+		return true
+	}
+	if bytes.Contains(content, []byte(`Gas Town OpenCode plugin`)) {
+		return bytes.Contains(content, []byte(`captureRun("gt prime")`)) ||
+			bytes.Contains(content, []byte("$`gt prime`")) ||
+			!bytes.Contains(content, []byte(`prime --hook`))
+	}
+	return false
 }
 
 // SyncResult describes what SyncForRole did.
@@ -122,7 +131,10 @@ func SyncForRole(provider, settingsDir, workDir, role, hooksDir, hooksFile strin
 		perm = 0600
 	}
 
-	if err := os.WriteFile(targetPath, content, perm); err != nil {
+	// Atomic write (temp + rename) prevents concurrent polecat spawns from
+	// interleaving truncates+writes into a partial JSON file that Claude
+	// rejects at startup. See gh#3500.
+	if err := atomicfile.WriteFile(targetPath, content, perm); err != nil {
 		return 0, fmt.Errorf("writing hooks file: %w", err)
 	}
 
@@ -180,7 +192,8 @@ func writeTemplate(provider, role, hooksFile, targetPath string) error {
 		perm = 0600
 	}
 
-	if err := os.WriteFile(targetPath, content, perm); err != nil {
+	// Atomic write (temp + rename) — see gh#3500.
+	if err := atomicfile.WriteFile(targetPath, content, perm); err != nil {
 		return fmt.Errorf("writing hooks file: %w", err)
 	}
 

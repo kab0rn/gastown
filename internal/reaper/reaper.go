@@ -155,6 +155,10 @@ const (
 	DefaultQueryTimeout = 30 * time.Second
 	// DefaultBatchSize is the number of rows per batch DELETE operation.
 	DefaultBatchSize = 100
+	// DefaultAlertThreshold is the open-wisp count above which callers should
+	// surface a warning. Sized above the natural steady-state for the current
+	// dog/deacon emit rate (~23 wisps/h × 24h TTL ≈ 550). See hq-57jr8.
+	DefaultAlertThreshold = 800
 )
 
 // ValidateDBName returns an error if the database name is unsafe.
@@ -266,12 +270,14 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 
 	// Count stale issue candidates.
 	// Same caveat: issues/dependencies tables may live on a separate Dolt instance.
+	// Convoys excluded to mirror AutoClose (hq-jnap): convoy lifecycle is
+	// tracked-bead-status driven, never staleness driven.
 	staleQuery := `
 		SELECT COUNT(*) FROM issues i
 		WHERE i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
 		AND i.priority > 1
-		AND i.issue_type != 'epic'
+		AND i.issue_type NOT IN ('epic', 'convoy')
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
 			INNER JOIN issues dep ON d.depends_on_id = dep.id
@@ -512,16 +518,12 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 			return totalDeleted, anomalies, nil
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d closed wisps from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
-			// "nothing to commit" is expected when wisps are dolt_ignored — deletes
-			// are auto-committed by the SQL layer and Dolt has nothing to version.
-			if !isNothingToCommit(err) {
-				// Non-fatal — log but continue.
-				anomalies = append(anomalies, Anomaly{
-					Type:    "dolt_commit_failed",
-					Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
-				})
-			}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+			// Non-fatal — log but continue.
+			anomalies = append(anomalies, Anomaly{
+				Type:    "dolt_commit_failed",
+				Message: fmt.Sprintf("dolt commit after purge failed: %v", err),
+			})
 		}
 	}
 
@@ -575,7 +577,7 @@ func purgeOldMail(db *sql.DB, dbName string, mailDeleteAge time.Duration, dryRun
 			return totalDeleted, fmt.Errorf("sql commit: %w", err)
 		}
 		commitMsg := fmt.Sprintf("reaper: purge %d old mail from %s", totalDeleted, dbName)
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 			// Non-fatal.
 		}
 	}
@@ -593,11 +595,17 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 	staleCutoff := time.Now().UTC().Add(-staleAge)
 	result := &AutoCloseResult{Database: dbName, DryRun: dryRun}
 
+	// Convoys are excluded from staleness auto-close (hq-jnap): their lifecycle
+	// is driven by tracked-bead status (`gt convoy check` / refinery post-merge),
+	// and the 'tracks' relation is non-blocking so the dependency exclusions
+	// below do NOT protect a convoy with open tracked issues. Stale-closing a
+	// convoy while its tracked beads are open orphans them from dispatch
+	// tracking and causes duplicate dispatches (hq-qouv/hq-shb1 incident).
 	whereClause := fmt.Sprintf(`
 		i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
 		AND i.priority > 1
-		AND i.issue_type != 'epic'
+		AND i.issue_type NOT IN ('epic', 'convoy')
 		AND i.id NOT IN (
 			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
 			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig')
